@@ -104,8 +104,12 @@ See:
 **Pre-alpha / foundation milestone.**
 
 The package, normalized models, adapter/provider contracts, versioned SQLite foundation,
-and desktop navigation shell are implemented. History discovery, importing, analysis,
-model calls, and instruction editing are not available yet.
+and desktop navigation shell are implemented. The Codex adapter supports explicit read-only
+plaintext rollout discovery, loading, and normalization. Importing, analysis, model calls,
+instruction editing, and history controls in the GUI are not available yet.
+
+Codex format coverage and deliberate limits are documented in
+[`tests/fixtures/codex/README.md`](tests/fixtures/codex/README.md).
 
 ## Initial v0.1 definition
 

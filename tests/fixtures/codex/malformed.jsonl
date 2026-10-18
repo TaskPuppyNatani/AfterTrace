@@ -1,0 +1,4 @@
+{"type": "session_meta", "payload": {"id": "00000000-0000-4000-8000-000000000003"}}
+{
+{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Keep valid evidence."}], "internal_chat_message_metadata_passthrough": {"content_item_metadata": [{"provenance": {"type": "user"}}]}}}
+{"type":"response_item","payload":

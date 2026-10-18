@@ -38,3 +38,20 @@ def test_platform_resolution_is_delegated(tmp_path, monkeypatch, platform_type):
     monkeypatch.setattr(paths, "user_data_path", resolve)
     assert paths.application_data_dir() == platform.user_data_path
     assert calls == [("AfterTrace", False, False)]
+
+
+def test_codex_home_default_override_and_tilde_are_platform_owned(tmp_path, monkeypatch):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(paths.Path, "home", classmethod(lambda cls: tmp_path))
+    assert paths.codex_history_directories() == (
+        tmp_path / ".codex" / "sessions",
+        tmp_path / ".codex" / "archived_sessions",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "custom home"))
+    assert paths.codex_history_directories()[0] == tmp_path / "custom home" / "sessions"
+    monkeypatch.setenv("CODEX_HOME", "")
+    assert paths.codex_history_directories()[0] == tmp_path / ".codex" / "sessions"
+    monkeypatch.setenv("CODEX_HOME", "~/codex-custom")
+    # expanduser uses the OS home environment, not the Path.home class method.
+    assert paths.codex_history_directories()[0] == Path("~/codex-custom").expanduser() / "sessions"
+    assert list(tmp_path.iterdir()) == []
