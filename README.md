@@ -103,10 +103,13 @@ See:
 
 **Pre-alpha / foundation milestone.**
 
-The package, normalized models, adapter/provider contracts, versioned SQLite foundation,
-and desktop navigation shell are implemented. The Codex adapter supports explicit read-only
-plaintext rollout discovery, loading, and normalization. Importing, analysis, model calls,
-instruction editing, and history controls in the GUI are not available yet.
+The package, normalized models, adapter/provider contracts, SQLite persistence, and desktop
+shell are implemented. Sources can discover Codex metadata; Projects can persist Included,
+Excluded, and Never Analyze decisions and explicitly import permitted plaintext histories.
+Analysis, model calls, instruction editing, and other harness parsers are not available yet.
+
+See [project scoping and explicit import](docs/project-scoping-import.md) for the workflow,
+identity rules, migration behavior, and privacy guarantees.
 
 Codex format coverage and deliberate limits are documented in
 [`tests/fixtures/codex/README.md`](tests/fixtures/codex/README.md).
@@ -156,8 +159,9 @@ aftertrace-gui
 `aftertrace` displays local-only status. `python -m aftertrace` provides the same CLI.
 To initialize an AfterTrace-owned database explicitly, run
 `aftertrace --init-db <path-to-aftertrace.sqlite3>`. Do not point this at a harness database.
-Application data paths use `platformdirs` for Linux, Windows, and macOS; merely opening
-the shell does not create a database or inspect histories.
+Application data paths use `platformdirs` for Linux, Windows, and macOS. Opening the shell
+initializes/migrates its database and reloads saved metadata in the background. History
+discovery and permitted transcript import each require an explicit action.
 
 Run verification in the activated environment:
 

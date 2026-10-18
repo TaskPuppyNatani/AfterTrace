@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
 
 from aftertrace import __version__
 from aftertrace.platform.paths import publisher_logo_path
+from aftertrace.services.workspace import WorkspaceService
+from aftertrace.ui.workspace import WorkspaceController, WorkspacePage
 
 DESTINATIONS = (
     "Overview",
@@ -42,23 +44,11 @@ _PAGE_COPY = {
         "Active instructions, drafts, and applied history will live here. "
         "Instruction changes will require a diff and your confirmation.",
     ),
-    "Projects": (
-        "You choose what AfterTrace can analyze.",
-        "No projects configured",
-        "Projects will support Included, Excluded, and Never Analyze. "
-        "Discovery alone will never grant permission to import or analyze a project.",
-    ),
     "Sessions": (
         "Source material for evidence-backed findings.",
-        "No sessions imported",
-        "Normalized sessions will appear here after an explicitly scoped import. "
+        "Session details are not available yet",
+        "Projects shows imported session counts. A session viewer is deferred. "
         "Original harness histories stay read-only.",
-    ),
-    "Sources": (
-        "Harness histories, connected on your terms.",
-        "No sources connected",
-        "Codex, Claude Code, and OpenCode adapter boundaries are in place. "
-        "History detection and import are not available in this build.",
     ),
     "Settings": (
         "A local-first workspace.",
@@ -112,12 +102,17 @@ def _card(title: str, body: str) -> QFrame:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, *, logo_path: Path | None = None) -> None:
+    def __init__(
+        self, *, logo_path: Path | None = None, service: WorkspaceService | None = None
+    ) -> None:
         super().__init__()
         self.setWindowTitle("AfterTrace")
         self.resize(1240, 820)
         self.setMinimumSize(900, 620)
         self.setStyleSheet(_STYLES)
+        self.workspace_controller = WorkspaceController(service or WorkspaceService(), self)
+        self._close_pending = False
+        self.workspace_controller.idle.connect(self._close_when_idle)
         root = QWidget()
         layout = QHBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -174,10 +169,32 @@ class MainWindow(QMainWindow):
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
         self.navigation.setCurrentRow(0)
         self.statusBar().showMessage(
-            "Foundation build · History import and analysis are not yet available"
+            "Discover sources → scope projects → import explicitly · Analysis is not yet available"
         )
+        self._startup_timer = QTimer(self)
+        self._startup_timer.setSingleShot(True)
+        self._startup_timer.timeout.connect(self.workspace_controller.reload)
+        self._startup_timer.start(0)
+
+    def closeEvent(self, event):
+        self._startup_timer.stop()
+        if self.workspace_controller.busy:
+            self._close_pending = True
+            self.statusBar().showMessage("Finishing the current operation before closing…")
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
+    def _close_when_idle(self):
+        if self._close_pending:
+            self.close()
 
     def _page(self, name: str) -> QScrollArea:
+        if name in ("Projects", "Sources"):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(WorkspacePage(self.workspace_controller, projects=name == "Projects"))
+            return scroll
         page = QWidget()
         page.setObjectName(f"page{name}")
         content = QVBoxLayout(page)
@@ -191,23 +208,27 @@ class MainWindow(QMainWindow):
             content.addWidget(_label("Learn from how you work with coding agents.", "muted"))
             stats = QHBoxLayout()
             stats.setSpacing(16)
-            for title in ("Sessions analyzed", "Projects included", "Sources connected"):
-                card = _card(title, "None yet")
-                card.layout().insertWidget(0, _label("0", "stat"))
+            for title, value, detail in (
+                ("Sessions analyzed", "0", "Analysis is not available"),
+                ("Project scoping", "→", "Open Projects"),
+                ("History discovery", "→", "Open Sources"),
+            ):
+                card = _card(title, detail)
+                card.layout().insertWidget(0, _label(value, "stat"))
                 stats.addWidget(card)
             content.addLayout(stats)
             content.addWidget(
                 _card(
                     "No strong patterns yet",
                     "AfterTrace will connect repeated instructions to original evidence. "
-                    "This build establishes the desktop shell; "
-                    "no histories have been read or analyzed.",
+                    "Use Sources to discover Codex metadata, then Projects to scope and "
+                    "explicitly import permitted history. Analysis is not yet available.",
                 )
             )
             content.addWidget(
                 _card(
                     "Your data stays under your control",
-                    "Local Only is the default. Future imports will require project scoping, "
+                    "Local Only is the default. Imports require project scoping, "
                     "and source histories will remain read-only.",
                 )
             )

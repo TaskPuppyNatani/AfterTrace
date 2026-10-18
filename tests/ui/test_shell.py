@@ -1,7 +1,10 @@
-from PySide6.QtCore import Qt, QTimer
+import os
+import subprocess
+import sys
+
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPixmap
 
-from aftertrace.ui import app as gui_app
 from aftertrace.ui.main_window import DESTINATIONS, MainWindow
 
 
@@ -40,6 +43,26 @@ def test_optional_branding_loads(qtbot, tmp_path):
     assert window.publisher_logo.isVisible()
 
 
-def test_gui_entry_point_runs_event_loop(qapp):
-    QTimer.singleShot(100, qapp.quit)
-    assert gui_app.main() == 0
+def test_gui_entry_point_runs_event_loop(tmp_path):
+    # Quitting a shared pytest QApplication interferes with later queued worker signals.
+    # Exercise the real entry function and event-loop shutdown in its own process.
+    script = """
+import sys
+from pathlib import Path
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
+from aftertrace.services import workspace
+from aftertrace.ui import app as gui_app
+workspace.database_path = lambda: Path(sys.argv[1])
+app = QApplication([])
+QTimer.singleShot(100, app.quit)
+raise SystemExit(gui_app.main())
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "entry.sqlite3")],
+        env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+        check=True,
+        timeout=10,
+        capture_output=True,
+        text=True,
+    )

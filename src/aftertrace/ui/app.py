@@ -15,4 +15,6 @@ def main() -> int:
     app.setOrganizationName("TaskPuppy Kreations")
     window = MainWindow()
     window.show()
-    return app.exec()
+    result = app.exec()
+    window.workspace_controller.finish_background_work()
+    return result

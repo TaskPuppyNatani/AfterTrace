@@ -21,6 +21,7 @@ EXPECTED_TABLES = {
     "applied_rules",
     "provider_configs",
     "scan_state",
+    "discovered_sessions",
 }
 
 
@@ -121,3 +122,102 @@ def test_constraints_and_caller_failure_rollback(tmp_path):
                 "INSERT INTO projects (id, display_name, privacy_state) "
                 "VALUES ('p', 'E', 'invalid')"
             )
+
+
+def make_version_one(path, privacy="included"):
+    # _TABLES intentionally remains the original foundation schema; v2 is a separate migration.
+    with sqlite3.connect(path) as connection:
+        for table, columns in database._TABLES.items():
+            connection.execute(
+                f"CREATE TABLE {table} (id TEXT PRIMARY KEY NOT NULL, "
+                f"metadata TEXT NOT NULL DEFAULT '{{}}', {columns})"
+            )
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute(
+            "INSERT INTO sources (id, harness, display_name, location) "
+            "VALUES ('s', 'codex', 'Example', 'example')"
+        )
+        connection.execute(
+            "INSERT INTO projects (id, display_name, privacy_state, metadata) VALUES (?, ?, ?, ?)",
+            ("p", "Example", privacy, '{"custom":"preserved"}'),
+        )
+        connection.execute(
+            "INSERT INTO project_sources (id, project_id, source_id, observed_path) "
+            "VALUES ('ps', 'p', 's', '/example')"
+        )
+        connection.execute(
+            "INSERT INTO sessions (id, source_id, source_session_id, project_id) "
+            "VALUES ('se', 's', 'native', 'p')"
+        )
+        connection.execute(
+            "INSERT INTO messages (id, session_id, sequence, content) "
+            "VALUES ('m', 'se', 0, 'V1_SYNTHETIC_CONTENT')"
+        )
+        connection.execute(
+            "INSERT INTO tool_calls (id, session_id, message_id, sequence, name) "
+            "VALUES ('t', 'se', 'm', 0, 'example')"
+        )
+        connection.execute(
+            "INSERT INTO scan_state (id, source_id, source_session_id, checkpoint) "
+            "VALUES ('sc', 's', 'native', 'imported')"
+        )
+
+
+def test_version_one_advances_without_discarding_existing_records(tmp_path):
+    path = tmp_path / "v1.sqlite3"
+    make_version_one(path)
+    assert initialize_database(path) == 2
+    assert initialize_database(path) == 2
+    with open_database(path) as connection:
+        assert (
+            connection.execute("SELECT content FROM messages").fetchone()[0]
+            == "V1_SYNTHETIC_CONTENT"
+        )
+        assert (
+            connection.execute("SELECT metadata FROM projects").fetchone()[0]
+            == '{"custom":"preserved"}'
+        )
+        assert connection.execute("SELECT count(*) FROM tool_calls").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM discovered_sessions").fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_version_one_never_analyze_decision_is_honored_during_upgrade(tmp_path):
+    path = tmp_path / "never-v1.sqlite3"
+    make_version_one(path, "never_analyze")
+    initialize_database(path)
+    with open_database(path) as connection:
+        assert (
+            connection.execute("SELECT privacy_state FROM projects").fetchone()[0]
+            == "never_analyze"
+        )
+        for table in ("sessions", "messages", "tool_calls", "scan_state"):
+            assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+    assert b"V1_SYNTHETIC_CONTENT" not in path.read_bytes()
+
+
+def test_migration_failure_rolls_back_schema_version_and_preserves_v1_data(tmp_path, monkeypatch):
+    path = tmp_path / "migration-failure.sqlite3"
+    make_version_one(path)
+    original = database._migrate_v2
+
+    def failure(connection):
+        original(connection)
+        connection.execute("invalid migration statement")
+
+    monkeypatch.setattr(database, "_migrate_v2", failure)
+    with pytest.raises(DatabaseError):
+        initialize_database(path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT content FROM messages").fetchone()[0]
+            == "V1_SYNTHETIC_CONTENT"
+        )
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'discovered_sessions'"
+            ).fetchall()
+            == []
+        )
