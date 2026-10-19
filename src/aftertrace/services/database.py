@@ -21,6 +21,7 @@ from aftertrace.core.models import (
     ToolStatus,
 )
 from aftertrace.platform.paths import database_path
+from aftertrace.services.finding_store import lineage_findings, purge_affected_findings
 
 SCHEMA_VERSION = 2
 
@@ -121,13 +122,17 @@ def schema_version(connection: sqlite3.Connection) -> int:
 
 def purge_project_content(connection: sqlite3.Connection, project_id: str) -> None:
     """Remove AfterTrace-owned content before committing a Never Analyze decision."""
-    # Existing evidence/drafts can contain excerpts even though no analyzer runs in this milestone.
+    # Receipts and historical lineage both identify derived content requiring removal.
     connection.execute("CREATE TEMP TABLE IF NOT EXISTS purged_findings (id TEXT PRIMARY KEY)")
     connection.execute("DELETE FROM purged_findings")
     connection.execute(
         "INSERT INTO purged_findings SELECT DISTINCT finding_id FROM finding_evidence "
         "WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?)",
         (project_id,),
+    )
+    connection.executemany(
+        "INSERT OR IGNORE INTO purged_findings VALUES (?)",
+        ((identity,) for identity in lineage_findings(connection, project_id)),
     )
     connection.execute(
         "DELETE FROM applied_rules WHERE rule_draft_id IN (SELECT id FROM rule_drafts "
@@ -140,10 +145,7 @@ def purge_project_content(connection: sqlite3.Connection, project_id: str) -> No
         "OR finding_id IN (SELECT id FROM purged_findings)",
         (project_id,),
     )
-    connection.execute(
-        "DELETE FROM finding_evidence WHERE finding_id IN (SELECT id FROM purged_findings)"
-    )
-    connection.execute("DELETE FROM findings WHERE id IN (SELECT id FROM purged_findings)")
+    purge_affected_findings(connection, project_id)
     connection.execute("DELETE FROM rules WHERE project_id = ?", (project_id,))
     connection.execute("DELETE FROM instruction_sources WHERE project_id = ?", (project_id,))
     connection.execute(

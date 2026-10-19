@@ -8,8 +8,12 @@ from uuid import NAMESPACE_URL, uuid5
 
 from aftertrace.adapters.base import SourceCandidate
 from aftertrace.core.errors import AfterTraceError
+from aftertrace.core.findings import FindingBundle
 from aftertrace.core.models import (
     ContentFormat,
+    Finding,
+    FindingEvidence,
+    FindingState,
     Harness,
     ImportedMessage,
     Message,
@@ -23,6 +27,7 @@ from aftertrace.core.models import (
 )
 from aftertrace.platform.projects import ProjectIdentity, contains_location, normalize_location
 from aftertrace.services.database import open_database, purge_project_content
+from aftertrace.services.finding_store import evidence_for, read_finding, synchronize
 from aftertrace.services.state import ProjectView, SourceView, WorkspaceSnapshot
 
 
@@ -84,39 +89,71 @@ class WorkspaceRepository:
         Excluded projects may retain old imported copies, but cannot support analysis.
         """
         with open_database(self.path) as connection:
-            rows = connection.execute(
-                "SELECT m.*, se.project_id, se.source_id, s.harness "
-                "FROM messages m JOIN sessions se ON se.id = m.session_id "
-                "JOIN projects p ON p.id = se.project_id "
-                "JOIN sources s ON s.id = se.source_id "
-                "WHERE p.privacy_state = 'included' AND se.imported_at IS NOT NULL "
-                "ORDER BY se.id, m.sequence, m.id"
-            ).fetchall()
-            result = []
-            try:
-                for row in rows:
-                    data = dict(row)
-                    context = {key: data.pop(key) for key in ("project_id", "source_id", "harness")}
-                    data.update(
-                        role=MessageRole(data["role"]),
-                        content_format=ContentFormat(data["content_format"]),
-                        timestamp=_date(data["timestamp"]),
-                        metadata=json.loads(data["metadata"]),
+            return self._imported_messages(connection)
+
+    @staticmethod
+    def _imported_messages(connection) -> list[ImportedMessage]:
+        rows = connection.execute(
+            "SELECT m.*, se.project_id, se.source_id, s.harness "
+            "FROM messages m JOIN sessions se ON se.id = m.session_id "
+            "JOIN projects p ON p.id = se.project_id "
+            "JOIN sources s ON s.id = se.source_id "
+            "WHERE p.privacy_state = 'included' AND se.imported_at IS NOT NULL "
+            "ORDER BY se.id, m.sequence, m.id"
+        ).fetchall()
+        result = []
+        try:
+            for row in rows:
+                data = dict(row)
+                context = {key: data.pop(key) for key in ("project_id", "source_id", "harness")}
+                data.update(
+                    role=MessageRole(data["role"]),
+                    content_format=ContentFormat(data["content_format"]),
+                    timestamp=_date(data["timestamp"]),
+                    metadata=json.loads(data["metadata"]),
+                )
+                result.append(
+                    ImportedMessage(
+                        message=Message(**data),
+                        project_id=context["project_id"],
+                        source_id=context["source_id"],
+                        harness=Harness(context["harness"]),
                     )
-                    result.append(
-                        ImportedMessage(
-                            message=Message(**data),
-                            project_id=context["project_id"],
-                            source_id=context["source_id"],
-                            harness=Harness(context["harness"]),
-                        )
-                    )
-            except (TypeError, ValueError):
-                # Malformed stored values must not expose private content in diagnostics.
+                )
+        except (TypeError, ValueError):
+            raise AfterTraceError(
+                "Imported message data is invalid.", operation="read_imported_messages"
+            ) from None
+        return result
+
+    def publish_repeated_findings(
+        self, build: Callable[[list[ImportedMessage]], list[FindingBundle]]
+    ) -> list[Finding]:
+        with open_database(self.path) as connection:
+            # Scope changes/imports cannot commit between snapshot validation and publication.
+            connection.execute("BEGIN IMMEDIATE")
+            return synchronize(connection, build(self._imported_messages(connection)))
+
+    def findings(self) -> list[Finding]:
+        with open_database(self.path) as connection:
+            return [read_finding(row) for row in connection.execute(
+                "SELECT * FROM findings ORDER BY distinct_session_count DESC, "
+                "occurrence_count DESC, canonical_pattern, id"
+            )]
+
+    def finding_evidence(self, finding_id: str) -> tuple[FindingEvidence, ...]:
+        with open_database(self.path) as connection:
+            return evidence_for(connection, finding_id)
+
+    def update_finding_state(self, finding_id: str, state: FindingState) -> None:
+        state = FindingState(state)
+        with open_database(self.path) as connection:
+            if connection.execute(
+                "UPDATE findings SET state = ? WHERE id = ?", (state.value, finding_id)
+            ).rowcount != 1:
                 raise AfterTraceError(
-                    "Imported message data is invalid.", operation="read_imported_messages"
-                ) from None
-            return result
+                    "Finding is no longer available.", operation="update_finding_state"
+                )
 
     def source_for(self, candidate: SourceCandidate) -> Source:
         location = str(Path(candidate.location).absolute())
