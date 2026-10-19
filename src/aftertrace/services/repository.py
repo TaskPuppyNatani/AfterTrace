@@ -9,7 +9,11 @@ from uuid import NAMESPACE_URL, uuid5
 from aftertrace.adapters.base import SourceCandidate
 from aftertrace.core.errors import AfterTraceError
 from aftertrace.core.models import (
+    ContentFormat,
     Harness,
+    ImportedMessage,
+    Message,
+    MessageRole,
     Project,
     ProjectPrivacyState,
     ProjectSource,
@@ -71,6 +75,48 @@ def _save(connection, table: str, data: dict) -> None:
 class WorkspaceRepository:
     def __init__(self, path: Path) -> None:
         self.path = path
+
+    def imported_messages_for_analysis(self) -> list[ImportedMessage]:
+        """Read only explicit imports whose projects are currently Included.
+
+        One query captures messages and durable scope in the same SQLite snapshot.
+        Discovery references, raw source locations, and tool records are not read.
+        Excluded projects may retain old imported copies, but cannot support analysis.
+        """
+        with open_database(self.path) as connection:
+            rows = connection.execute(
+                "SELECT m.*, se.project_id, se.source_id, s.harness "
+                "FROM messages m JOIN sessions se ON se.id = m.session_id "
+                "JOIN projects p ON p.id = se.project_id "
+                "JOIN sources s ON s.id = se.source_id "
+                "WHERE p.privacy_state = 'included' AND se.imported_at IS NOT NULL "
+                "ORDER BY se.id, m.sequence, m.id"
+            ).fetchall()
+            result = []
+            try:
+                for row in rows:
+                    data = dict(row)
+                    context = {key: data.pop(key) for key in ("project_id", "source_id", "harness")}
+                    data.update(
+                        role=MessageRole(data["role"]),
+                        content_format=ContentFormat(data["content_format"]),
+                        timestamp=_date(data["timestamp"]),
+                        metadata=json.loads(data["metadata"]),
+                    )
+                    result.append(
+                        ImportedMessage(
+                            message=Message(**data),
+                            project_id=context["project_id"],
+                            source_id=context["source_id"],
+                            harness=Harness(context["harness"]),
+                        )
+                    )
+            except (TypeError, ValueError):
+                # Malformed stored values must not expose private content in diagnostics.
+                raise AfterTraceError(
+                    "Imported message data is invalid.", operation="read_imported_messages"
+                ) from None
+            return result
 
     def source_for(self, candidate: SourceCandidate) -> Source:
         location = str(Path(candidate.location).absolute())

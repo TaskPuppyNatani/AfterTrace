@@ -358,3 +358,113 @@ def test_application_and_ui_boundaries_have_no_analysis_provider_or_direct_sql_c
         and node.func.attr in ("execute", "executescript", "load_raw_session", "normalize_session")
         for node in ast.walk(tree)
     )
+
+
+def test_repetition_analysis_reads_only_currently_permitted_explicit_imports(
+    workspace, monkeypatch
+):
+    from aftertrace.analysis.repetitions import RepeatedInstructionAnalyzer
+    from aftertrace.core.models import Harness
+
+    service, repo, source = workspace
+    excluded = git_repository(repo.parent / "excluded")
+    never = git_repository(repo.parent / "never")
+    for number, project in enumerate((repo, excluded, never), start=1):
+        for occurrence in range(3):
+            write_session(source, project, number * 10 + occurrence)
+    write_session(source, None, 100)
+    service.discover()
+    for view in service.snapshot().projects:
+        service.set_privacy(view.project.id, Privacy.INCLUDED)
+    assert service.import_included().imported == 9
+    permitted_id = None
+    for view in service.snapshot().projects:
+        if view.project.primary_location == str(excluded):
+            service.set_privacy(view.project.id, Privacy.EXCLUDED)
+        elif view.project.primary_location == str(never):
+            service.set_privacy(view.project.id, Privacy.NEVER_ANALYZE)
+        else:
+            permitted_id = view.project.id
+
+    # Newly discovered Included history still requires a separate explicit import.
+    write_session(source, repo, 200)
+    service.discover()
+    with open_database(service.repository.path) as connection:
+        source_id = connection.execute("SELECT id FROM sources LIMIT 1").fetchone()[0]
+        # Foundation/partial rows without an import marker are not analysis input either.
+        connection.execute(
+            "INSERT INTO sessions (id, source_id, project_id) VALUES (?, ?, ?)",
+            ("not-imported", source_id, permitted_id),
+        )
+        connection.execute(
+            "INSERT INTO messages (id, session_id, sequence, role, author_source, content) "
+            "VALUES ('not-imported-m', 'not-imported', 0, 'user', 'user', ?) ",
+            ("Keep the change focused.",),
+        )
+    before = counts(service)
+    assert before["sessions"] == 7  # Three permitted, three Excluded, one unimported.
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Analysis must not discover, load, or normalize raw history.")
+
+    for method in ("detect", "discover_sessions", "load_raw_session", "normalize_session"):
+        monkeypatch.setattr(service.adapter, method, forbidden)
+    messages = service.repository.imported_messages_for_analysis()
+    assert messages == service.repository.imported_messages_for_analysis()
+    assert {item.project_id for item in messages} == {permitted_id}
+    assert {item.harness for item in messages} == {Harness.CODEX}
+    assert len({item.message.session_id for item in messages}) == 3
+    assert all(item.message.session_id != "not-imported" for item in messages)
+
+    candidates = RepeatedInstructionAnalyzer().analyze(messages)
+    focused = next(
+        item for item in candidates if item.canonical_key.startswith("keep the change focused.")
+    )
+    assert focused.occurrence_count == focused.distinct_session_count == 3
+    assert focused.distinct_project_count == 1
+    assert counts(service) == before
+    with open_database(service.repository.path) as connection:
+        stored = {row["id"]: dict(row) for row in connection.execute("SELECT * FROM messages")}
+        for item in messages:
+            original = stored[item.message.id]
+            assert item.message.content == original["content"]
+            assert item.message.author_source == original["author_source"]
+            assert item.message.sequence == original["sequence"]
+            assert item.message.timestamp.isoformat() == original["timestamp"]
+        for table in ("findings", "finding_evidence", "provider_configs"):
+            assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_repetition_analysis_has_no_history_before_explicit_import(workspace):
+    from aftertrace.analysis.repetitions import RepeatedInstructionAnalyzer
+
+    service, repo, source = workspace
+    for number in range(3):
+        write_session(source, repo, number)
+    service.discover()
+    included(service)
+    assert service.repository.imported_messages_for_analysis() == []
+    assert RepeatedInstructionAnalyzer().analyze(
+        service.repository.imported_messages_for_analysis()
+    ) == []
+
+
+@pytest.mark.parametrize(("column", "invalid"), [
+    ("timestamp", "PRIVATE_SYNTHETIC_INVALID_DATE"),
+    ("metadata", "PRIVATE_SYNTHETIC_INVALID_JSON"),
+])
+def test_invalid_imported_message_fails_with_content_free_application_error(
+    workspace, column, invalid
+):
+    service, repo, source = workspace
+    write_session(source, repo)
+    service.discover()
+    included(service)
+    assert service.import_included().imported == 1
+    with open_database(service.repository.path) as connection:
+        connection.execute(f"UPDATE messages SET {column} = ?", (invalid,))
+    with pytest.raises(AfterTraceError, match="Imported message data is invalid") as caught:
+        service.repository.imported_messages_for_analysis()
+    assert invalid not in str(caught.value)
+    assert caught.value.detail is None
+    assert caught.value.__suppress_context__

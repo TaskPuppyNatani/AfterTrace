@@ -202,6 +202,16 @@ class Session(Entity):
     updated_at: datetime | None = None
 
 
+@dataclass(frozen=True, kw_only=True)
+class ImportedMessage:
+    """A normalized message with context from a permitted imported session."""
+
+    message: Message
+    project_id: str
+    source_id: str
+    harness: Harness
+
+
 @dataclass(kw_only=True)
 class InstructionSource(Entity):
     harness: Harness
