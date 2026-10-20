@@ -11,7 +11,11 @@ from aftertrace.core.findings import ANALYSIS_VERSION, confidence_for_sessions
 from aftertrace.core.models import FindingConfidence, FindingState, Harness, ProjectPrivacyState
 from aftertrace.services import finding_store
 from aftertrace.services.database import SCHEMA_VERSION, open_database
-from aftertrace.services.findings import FindingPublicationService, RepetitionQualityGate
+from aftertrace.services.findings import (
+    FindingPublicationService,
+    FindingsService,
+    RepetitionQualityGate,
+)
 from aftertrace.services.repository import WorkspaceRepository
 
 
@@ -481,4 +485,81 @@ def test_incomparable_historical_timestamps_fail_with_domain_error_and_preserve_
         )
     with pytest.raises(AfterTraceError, match="timezone"):
         service.run()
+    assert snapshot(repository) == before
+
+
+def test_ui_queries_are_reads_and_evidence_is_only_loaded_on_demand(history, monkeypatch):
+    repository, _ = history
+    service = FindingsService(repository)
+    assert service.snapshot().eligible_session_count == 3
+    assert service.snapshot().findings == ()
+    (finding,) = service.analyze().findings
+
+    def forbidden(*args):
+        pytest.fail("Summary reads must not analyze history or load receipts.")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service.publisher, "run", forbidden)
+        patch.setattr("aftertrace.services.repository.read_evidence", forbidden)
+        assert service.snapshot().findings == (finding,)
+    before = snapshot(repository)
+    detail = service.detail(finding.id)
+    assert detail.finding == finding
+    assert len(detail.evidence) == 3
+    assert detail.evidence[0].evidence.original_text == "Run the tests."
+    assert detail.evidence[0].project_name == "Synthetic"
+    assert detail.evidence[0].source_name == "Synthetic"
+    assert detail.evidence[0].harness is Harness.CODEX
+    assert detail.evidence[0].session_title is None
+    assert service.detail("missing") is None
+    assert snapshot(repository) == before  # Opening evidence never changes lifecycle state.
+
+
+def test_ui_queries_hide_unsupported_history_without_deleting_it(history):
+    repository, _ = history
+    service = FindingsService(repository)
+    (finding,) = service.analyze().findings
+    repository.set_privacy("p", ProjectPrivacyState.EXCLUDED)
+    assert service.analyze().findings == ()
+    assert service.snapshot().eligible_session_count == 0
+    assert service.detail(finding.id) is None
+    assert repository.findings()[0].id == finding.id
+
+
+def test_ui_detail_metadata_comes_from_persisted_relationships(history):
+    repository, _ = history
+    (finding,) = FindingsService(repository).analyze().findings
+    with open_database(repository.path) as connection:
+        connection.execute("UPDATE projects SET display_name = 'Example project'")
+        connection.execute("UPDATE sources SET display_name = 'Example source'")
+        connection.execute("UPDATE sessions SET title = 'Example session'")
+    detail = FindingsService(repository).detail(finding.id)
+    assert all(view.project_name == "Example project" for view in detail.evidence)
+    assert all(view.source_name == "Example source" for view in detail.evidence)
+    assert all(view.session_title == "Example session" for view in detail.evidence)
+
+
+def test_ui_analysis_orchestration_calls_publication_once_and_preserves_on_failure(
+    history, monkeypatch
+):
+    repository, _ = history
+    service = FindingsService(repository)
+    original = service.publisher.run
+    calls = []
+
+    def run_once():
+        calls.append(True)
+        return original()
+
+    monkeypatch.setattr(service.publisher, "run", run_once)
+    service.analyze()
+    assert calls == [True]
+    before = snapshot(repository)
+
+    def fail():
+        raise AfterTraceError("Synthetic private failure", operation="publish_findings")
+
+    monkeypatch.setattr(service.publisher, "run", fail)
+    with pytest.raises(AfterTraceError):
+        service.analyze()
     assert snapshot(repository) == before

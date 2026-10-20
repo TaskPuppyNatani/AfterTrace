@@ -36,6 +36,21 @@ remaining sessions a retained Finding is explicitly unsupported; with no permitt
 receipts it is deleted. Legacy Findings retain conservative whole-Finding deletion.
 
 `repository.findings()`, `finding_evidence(id)`, and `update_finding_state(id, state)`
-provide the backend boundary for a later UI. Callers must inspect `currently_supported`
+provide the backend boundary. Callers must inspect `currently_supported`
 when showing current results. The existing import safeguard still rejects replacement
 of normalized messages referenced by evidence, preserving the old copy on failure.
+
+## Desktop Findings (M4C)
+
+Open **Findings → Analyze Imported History** to explicitly run this pipeline in a worker
+thread. Navigating to Findings or selecting **Refresh** only reloads persisted summaries
+and the eligible imported-session count; it never imports, discovers, or analyzes history.
+`FindingsService` exposes current repeated-instruction Findings in repository order.
+Unsupported history remains stored but is hidden from this view. Lifecycle state is
+displayed without editing or hidden transitions.
+
+**View Evidence** loads only that Finding's persisted instruction receipts and related
+project/source/session metadata, in a worker. The dialog preserves original wording and
+shows persisted analyzer provenance. Refresh closes and clears open evidence views;
+scope operations invalidate displayed data, and late worker results cannot restore an
+invalidated view. No transcript browser, recommendations, or provider calls are involved.

@@ -27,8 +27,14 @@ from aftertrace.core.models import (
 )
 from aftertrace.platform.projects import ProjectIdentity, contains_location, normalize_location
 from aftertrace.services.database import open_database, purge_project_content
-from aftertrace.services.finding_store import evidence_for, read_finding, synchronize
-from aftertrace.services.state import ProjectView, SourceView, WorkspaceSnapshot
+from aftertrace.services.finding_store import evidence_for, read_evidence, read_finding, synchronize
+from aftertrace.services.state import (
+    EvidenceView,
+    FindingDetail,
+    ProjectView,
+    SourceView,
+    WorkspaceSnapshot,
+)
 
 
 def _now() -> str:
@@ -144,6 +150,52 @@ class WorkspaceRepository:
     def finding_evidence(self, finding_id: str) -> tuple[FindingEvidence, ...]:
         with open_database(self.path) as connection:
             return evidence_for(connection, finding_id)
+
+    def finding_overview(self) -> tuple[list[Finding], int]:
+        """Read persisted summaries and an eligible-history count, without loading receipts."""
+        with open_database(self.path) as connection:
+            connection.execute("BEGIN")
+            findings = [read_finding(row) for row in connection.execute(
+                "SELECT * FROM findings ORDER BY distinct_session_count DESC, "
+                "occurrence_count DESC, canonical_pattern, id"
+            )]
+            count = connection.execute(
+                "SELECT count(*) FROM sessions se JOIN projects p ON p.id = se.project_id "
+                "WHERE p.privacy_state = 'included' AND se.imported_at IS NOT NULL"
+            ).fetchone()[0]
+            return findings, count
+
+    def finding_detail(self, finding_id: str) -> FindingDetail | None:
+        """Read one Finding and its persisted instruction receipts in one snapshot."""
+        with open_database(self.path) as connection:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT * FROM findings WHERE id = ?", (finding_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            finding = read_finding(row)
+            rows = connection.execute(
+                "SELECT e.*, p.display_name AS project_name, s.display_name AS source_name, "
+                "s.harness AS harness, se.title AS session_title "
+                "FROM finding_evidence e JOIN sessions se ON se.id = e.session_id "
+                "JOIN messages m ON m.id = e.message_id AND m.session_id = se.id "
+                "JOIN projects p ON p.id = se.project_id JOIN sources s ON s.id = se.source_id "
+                "WHERE e.finding_id = ? ORDER BY e.session_id, e.message_id, "
+                "e.start_offset, e.end_offset, e.id", (finding_id,),
+            ).fetchall()
+            evidence = []
+            for row in rows:
+                data = dict(row)
+                context = {key: data.pop(key) for key in (
+                    "project_name", "source_name", "harness", "session_title"
+                )}
+                evidence.append(EvidenceView(
+                    evidence=read_evidence(data), project_name=context["project_name"],
+                    source_name=context["source_name"], harness=Harness(context["harness"]),
+                    session_title=context["session_title"],
+                ))
+            return FindingDetail(finding, tuple(evidence))
 
     def update_finding_state(self, finding_id: str, state: FindingState) -> None:
         state = FindingState(state)

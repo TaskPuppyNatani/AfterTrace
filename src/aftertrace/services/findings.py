@@ -18,8 +18,16 @@ from aftertrace.core.findings import (
     finding_identity,
     summarize_repetition,
 )
-from aftertrace.core.models import Finding, FindingEvidence, Harness, ImportedMessage, MessageRole
+from aftertrace.core.models import (
+    Finding,
+    FindingEvidence,
+    FindingType,
+    Harness,
+    ImportedMessage,
+    MessageRole,
+)
 from aftertrace.services.repository import WorkspaceRepository
+from aftertrace.services.state import FindingDetail, FindingsSnapshot
 
 
 class RepetitionQualityGate:
@@ -176,3 +184,28 @@ class FindingPublicationService:
             return [synthesize_repetition(item, now) for item in validated]
 
         return self.repository.publish_repeated_findings(build)
+
+
+class FindingsService:
+    """Thin UI boundary: summary reads, on-demand receipts, and explicit full analysis."""
+
+    def __init__(self, repository: WorkspaceRepository) -> None:
+        self.repository = repository
+        self.publisher = FindingPublicationService(repository)
+
+    @staticmethod
+    def _current(finding: Finding) -> bool:
+        return (finding.finding_type == FindingType.REPEATED_INSTRUCTION
+                and finding.metadata.get("currently_supported") is True)
+
+    def snapshot(self) -> FindingsSnapshot:
+        findings, count = self.repository.finding_overview()
+        return FindingsSnapshot(tuple(item for item in findings if self._current(item)), count)
+
+    def detail(self, finding_id: str) -> FindingDetail | None:
+        detail = self.repository.finding_detail(finding_id)
+        return detail if detail and self._current(detail.finding) else None
+
+    def analyze(self) -> FindingsSnapshot:
+        self.publisher.run()
+        return self.snapshot()

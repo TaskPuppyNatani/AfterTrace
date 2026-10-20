@@ -17,4 +17,5 @@ def main() -> int:
     window.show()
     result = app.exec()
     window.workspace_controller.finish_background_work()
+    window.findings_controller.finish_background_work()
     return result

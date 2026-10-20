@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -16,36 +16,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from aftertrace.core.errors import AfterTraceError
 from aftertrace.core.models import ProjectPrivacyState
 from aftertrace.services.state import WorkspaceSnapshot
 from aftertrace.services.workspace import WorkspaceService
+from aftertrace.ui.jobs import Job
 
 SCOPES = (
     ("Included", ProjectPrivacyState.INCLUDED, "#50e5b3"),
     ("Excluded", ProjectPrivacyState.EXCLUDED, "#b3bed2"),
     ("Never Analyze", ProjectPrivacyState.NEVER_ANALYZE, "#ff9797"),
 )
-
-
-class _Job(QThread):
-    completed = Signal(object, str)
-    failed = Signal(str)
-
-    def __init__(self, service: WorkspaceService, action: Callable[[], str], parent: QObject):
-        super().__init__(parent)
-        self.service, self.action = service, action
-
-    def run(self):
-        try:
-            notice = self.action()
-            snapshot = self.service.snapshot()
-        except AfterTraceError as error:
-            self.failed.emit(f"{error.operation}: Operation failed. You can retry.")
-        except Exception:
-            self.failed.emit("Operation failed. You can retry.")
-        else:
-            self.completed.emit(snapshot, notice)
 
 
 class WorkspaceController(QObject):
@@ -58,7 +38,7 @@ class WorkspaceController(QObject):
         super().__init__(parent)
         self.service = service
         self.state = WorkspaceSnapshot()
-        self.job: _Job | None = None
+        self.job: Job | None = None
 
     @property
     def busy(self) -> bool:
@@ -67,7 +47,11 @@ class WorkspaceController(QObject):
     def run(self, action: Callable[[], str]) -> None:
         if self.busy:
             return
-        self.job = _Job(self.service, action, self)
+        def work():
+            notice = action()
+            return self.service.snapshot(), notice
+
+        self.job = Job(work, self)
         self.job.completed.connect(self._completed)
         self.job.failed.connect(self._failed)
         self.job.finished.connect(self._finished)
@@ -87,7 +71,8 @@ class WorkspaceController(QObject):
     def set_privacy(self, project_id, state) -> None:
         self.run(lambda: self.service.set_privacy(project_id, state))
 
-    def _completed(self, state, notice):
+    def _completed(self, result):
+        state, notice = result
         self.state = state
         self.changed.emit(state)
         self.notice.emit(notice or "Saved workspace metadata loaded.")

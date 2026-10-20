@@ -18,7 +18,9 @@ from PySide6.QtWidgets import (
 
 from aftertrace import __version__
 from aftertrace.platform.paths import publisher_logo_path
+from aftertrace.services.findings import FindingsService
 from aftertrace.services.workspace import WorkspaceService
+from aftertrace.ui.findings import FindingsController, FindingsPage
 from aftertrace.ui.workspace import WorkspaceController, WorkspacePage
 
 DESTINATIONS = (
@@ -32,12 +34,6 @@ DESTINATIONS = (
 )
 
 _PAGE_COPY = {
-    "Findings": (
-        "Evidence before conclusions.",
-        "No findings yet",
-        "Repeated instructions and persistent rule candidates will appear here with inspectable "
-        "evidence. Analysis is not available in this foundation build.",
-    ),
     "Instructions": (
         "Turn recurring instructions into reviewable rules.",
         "No instruction drafts yet",
@@ -111,8 +107,14 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(900, 620)
         self.setStyleSheet(_STYLES)
         self.workspace_controller = WorkspaceController(service or WorkspaceService(), self)
+        self.findings_controller = FindingsController(
+            FindingsService(self.workspace_controller.service.repository), self
+        )
         self._close_pending = False
         self.workspace_controller.idle.connect(self._close_when_idle)
+        self.findings_controller.idle.connect(self._close_when_idle)
+        self.workspace_controller.busy_changed.connect(self.findings_controller.set_workspace_busy)
+        self.workspace_controller.idle.connect(self._refresh_findings_if_visible)
         root = QWidget()
         layout = QHBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -166,10 +168,10 @@ class MainWindow(QMainWindow):
             self.pages.addWidget(self._page(name))
         main.addWidget(self.pages, 1)
         layout.addWidget(content, 1)
-        self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.navigation.currentRowChanged.connect(self._navigate)
         self.navigation.setCurrentRow(0)
         self.statusBar().showMessage(
-            "Discover sources → scope projects → import explicitly · Analysis is not yet available"
+            "Discover sources → scope projects → import explicitly → Analyze in Findings"
         )
         self._startup_timer = QTimer(self)
         self._startup_timer.setSingleShot(True)
@@ -178,7 +180,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._startup_timer.stop()
-        if self.workspace_controller.busy:
+        self.findings_controller.begin_close()
+        if self.workspace_controller.busy or self.findings_controller.busy:
             self._close_pending = True
             self.statusBar().showMessage("Finishing the current operation before closing…")
             event.ignore()
@@ -189,7 +192,21 @@ class MainWindow(QMainWindow):
         if self._close_pending:
             self.close()
 
+    def _navigate(self, index: int):
+        self.pages.setCurrentIndex(index)
+        if index == DESTINATIONS.index("Findings"):
+            self.findings_controller.reload()
+
+    def _refresh_findings_if_visible(self):
+        if self.pages.currentIndex() == DESTINATIONS.index("Findings"):
+            self.findings_controller.reload()
+
     def _page(self, name: str) -> QScrollArea:
+        if name == "Findings":
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(FindingsPage(self.findings_controller))
+            return scroll
         if name in ("Projects", "Sources"):
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
@@ -209,7 +226,7 @@ class MainWindow(QMainWindow):
             stats = QHBoxLayout()
             stats.setSpacing(16)
             for title, value, detail in (
-                ("Sessions analyzed", "0", "Analysis is not available"),
+                ("Repeated instructions", "→", "Open Findings"),
                 ("Project scoping", "→", "Open Projects"),
                 ("History discovery", "→", "Open Sources"),
             ):
@@ -222,7 +239,7 @@ class MainWindow(QMainWindow):
                     "No strong patterns yet",
                     "AfterTrace will connect repeated instructions to original evidence. "
                     "Use Sources to discover Codex metadata, then Projects to scope and "
-                    "explicitly import permitted history. Analysis is not yet available.",
+                    "explicitly import permitted history, then analyze it from Findings.",
                 )
             )
             content.addWidget(

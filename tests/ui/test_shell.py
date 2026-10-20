@@ -5,6 +5,7 @@ import sys
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPixmap
 
+from aftertrace.ui.findings import FindingsPage
 from aftertrace.ui.main_window import DESTINATIONS, MainWindow
 
 
@@ -29,6 +30,10 @@ def test_navigation_privacy_and_missing_branding(qtbot, tmp_path):
         assert window.pages.currentIndex() == index
         assert window.pages.currentWidget().widget().objectName() == f"page{name}"
         assert window.privacy_status.isVisible()
+    assert isinstance(window.pages.widget(1).widget(), FindingsPage)
+    qtbot.waitUntil(
+        lambda: not window.workspace_controller.busy and not window.findings_controller.busy
+    )
 
 
 def test_optional_branding_loads(qtbot, tmp_path):
