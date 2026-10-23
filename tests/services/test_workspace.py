@@ -61,6 +61,146 @@ def test_remote_identity_across_locations_reuses_logical_project_and_decision(wo
     assert project.discovered == 2
 
 
+def test_moved_repository_and_reused_path_preserve_identity_history_and_privacy(workspace):
+    from aftertrace.services.findings import FindingPublicationService
+
+    service, repo, source = workspace
+    set_origin(repo, None)
+    for number in range(1, 4):
+        write_session(source, repo, number)
+    service.discover()
+    old_id = included(service)
+    assert service.import_included().imported == 3
+    assert FindingPublicationService(service.repository).run()
+    with open_database(service.repository.path) as connection:
+        history = {
+            table: [dict(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")]
+            for table in ("sessions", "messages", "tool_calls", "findings", "finding_evidence")
+        }
+        schema = connection.execute("PRAGMA schema_version").fetchone()[0]
+
+    moved = repo.with_name(repo.name + "-legacy")
+    repo.rename(moved)
+    git_repository(repo)
+    # The imported history remains durable even when its source is no longer discoverable.
+    source.rename(source.with_name("retired-synthetic-history"))
+    for number in range(4, 6):
+        write_session(source, repo, number)
+    service.discover()
+
+    def project_state(workspace_service):
+        snapshot = workspace_service.snapshot()
+        assert snapshot.identity_conflicts == snapshot.identity_warnings == ()
+        assert len(snapshot.projects) == 2
+        return {
+            view.project.id: (
+                view.project.canonical_identity,
+                view.project.privacy_state,
+                view.project.primary_location,
+                view.locations,
+                view.discovered,
+                view.imported,
+            )
+            for view in snapshot.projects
+        }
+
+    state = project_state(service)
+    old = state[old_id]
+    new_id = next(project_id for project_id in state if project_id != old_id)
+    assert old == (
+        service.identify(str(moved)).canonical_identity,
+        Privacy.INCLUDED,
+        str(moved),
+        (str(moved),),
+        0,
+        3,
+    )
+    assert state[new_id] == (
+        service.identify(str(repo)).canonical_identity,
+        Privacy.EXCLUDED,
+        str(repo),
+        (str(repo),),
+        2,
+        0,
+    )
+    service.discover()
+    assert project_state(service) == state
+    restarted = WorkspaceService(service.repository.path)
+    assert project_state(restarted) == state
+    restarted.discover()
+    assert project_state(restarted) == state
+    with open_database(service.repository.path) as connection:
+        for table, before in history.items():
+            assert [
+                dict(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")
+            ] == before
+        assert connection.execute("PRAGMA schema_version").fetchone()[0] == schema
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute(
+            "SELECT count(*) FROM project_sources WHERE project_id=?", (old_id,)
+        ).fetchone()[0] == 1
+
+
+def test_verified_session_location_repairs_reused_remote_location(workspace):
+    service, repo, source = workspace
+    write_session(source, repo)
+    service.discover()
+    old_id = included(service)
+    assert service.import_included().imported == 1
+    moved = repo.with_name("moved")
+    repo.rename(moved)
+    git_repository(repo, "https://example.invalid/team/different.git")
+    write_session(source, moved, 2)
+    service.discover()
+    old = next(view for view in service.snapshot().projects if view.project.id == old_id)
+    assert old.project.primary_location == str(moved)
+    assert old.locations == (str(moved),)
+    assert old.discovered == old.imported == 1
+    assert old.project.privacy_state is Privacy.INCLUDED
+    assert service.snapshot().identity_warnings == service.snapshot().identity_conflicts == ()
+    with open_database(service.repository.path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM project_sources WHERE project_id=?", (old_id,)
+        ).fetchone()[0] == 1
+
+
+def test_unavailable_remote_location_is_not_replaced_by_another_clone(workspace):
+    service, repo, source = workspace
+    write_session(source, repo)
+    service.discover()
+    repo.rename(repo.with_name("inaccessible-location"))
+    other = git_repository(repo.with_name("clone"), "https://example.invalid/team/example.git")
+    write_session(source, other, 2)
+    service.discover()
+    (project,) = service.snapshot().projects
+    assert project.project.primary_location == str(repo)
+    assert set(project.locations) == {str(repo), str(other)}
+
+
+def test_location_repair_rolls_back_if_primary_location_write_fails(workspace):
+    service, repo, source = workspace
+    set_origin(repo, None)
+    write_session(source, repo)
+    service.discover()
+    project_id = included(service)
+    moved = repo.with_name("moved")
+    repo.rename(moved)
+    git_repository(repo)
+    with open_database(service.repository.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_relocation BEFORE UPDATE OF primary_location ON projects "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic relocation rollback'); END"
+        )
+        before = list(connection.iterdump())
+    with pytest.raises(DatabaseError):
+        service.repository.reconcile_project_locations(
+            project_id, service.identify(str(moved)), [str(repo)]
+        )
+    with open_database(service.repository.path) as connection:
+        assert list(connection.iterdump()) == before
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 @pytest.mark.parametrize("state", list(Privacy))
 def test_privacy_state_survives_reload_and_rediscovery(workspace, state):
     service, repo, source = workspace
@@ -604,10 +744,190 @@ def test_identity_reconciliation_does_not_resolve_conflicting_privacy(
     assert {
         view.project.id: view.project.privacy_state for view in service.snapshot().projects
     } == before
+    (conflict,) = service.snapshot().identity_conflicts
+    assert conflict.match_basis == "verified_identity"
+    assert conflict.can_merge_without_purging is (conflicting is Privacy.EXCLUDED)
+    if conflicting is Privacy.NEVER_ANALYZE:
+        with open_database(service.repository.path) as connection:
+            sessions_before = connection.execute("SELECT count(*) FROM sessions").fetchone()[0]
+        with pytest.raises(AfterTraceError, match="cannot be merged"):
+            service.resolve_project_privacy_conflict(conflict, Privacy.EXCLUDED)
+        assert len(service.snapshot().projects) == 2
+        assert {
+            view.project.id: view.project.privacy_state for view in service.snapshot().projects
+        } == before
+        with open_database(service.repository.path) as connection:
+            assert (
+                connection.execute("SELECT count(*) FROM sessions").fetchone()[0]
+                == sessions_before
+            )
     calls = []
     monkeypatch.setattr(service.adapter, "load_raw_session", lambda *args: calls.append(True))
     result = service.import_included()
     assert result.imported == 0 and calls == []
+
+
+def privacy_conflict_repro(workspace):
+    service, local_id, finding_id = legacy_identity_split(workspace)
+    other_id = next(
+        view.project.id for view in service.snapshot().projects if view.project.id != local_id
+    )
+    service.set_privacy(local_id, Privacy.EXCLUDED)
+    service.discover()
+    (conflict,) = service.snapshot().identity_conflicts
+    assert conflict.project_ids == tuple(sorted((local_id, other_id)))
+    return service, conflict, finding_id
+
+
+def test_conflicting_duplicate_privacy_is_surfaced_without_choosing_a_policy(
+    workspace, monkeypatch
+):
+    service, conflict, _ = privacy_conflict_repro(workspace)
+    before = {
+        view.project.id: view.project.privacy_state for view in service.snapshot().projects
+    }
+    assert len(before) == 2
+    assert set(before.values()) == {Privacy.INCLUDED, Privacy.EXCLUDED}
+    assert conflict.match_basis == "verified_identity"
+    calls = []
+    monkeypatch.setattr(service.adapter, "load_raw_session", lambda *args: calls.append(True))
+    assert service.import_included().imported == 0
+    assert calls == []
+    assert {
+        view.project.id: view.project.privacy_state for view in service.snapshot().projects
+    } == before
+
+
+def test_keep_excluded_merge_preserves_imports_evidence_and_refresh_state(workspace):
+    from aftertrace.services.findings import FindingsService
+
+    service, conflict, finding_id = privacy_conflict_repro(workspace)
+    with open_database(service.repository.path) as connection:
+        before = {
+            table: [dict(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")]
+            for table in ("sessions", "messages", "tool_calls", "finding_evidence")
+        }
+    service.resolve_project_privacy_conflict(conflict, Privacy.EXCLUDED)
+    assert service.resolve_project_privacy_conflict(
+        conflict, Privacy.EXCLUDED
+    ) == "Project conflict was already resolved."
+    snapshot = service.snapshot()
+    (project,) = snapshot.projects
+    assert project.project.privacy_state is Privacy.EXCLUDED
+    assert project.imported == 13
+    assert snapshot.identity_conflicts == ()
+    assert service.import_included().blocked == 13
+    with open_database(service.repository.path) as connection:
+        assert connection.execute("SELECT count(*) FROM projects").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM project_sources").fetchone()[0] == 1
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        after_sessions = [
+            dict(row) for row in connection.execute("SELECT * FROM sessions ORDER BY id")
+        ]
+        assert [row["id"] for row in after_sessions] == [row["id"] for row in before["sessions"]]
+        assert all(row["project_id"] == project.project.id for row in after_sessions)
+        for table in ("messages", "tool_calls"):
+            assert [
+                dict(row)
+                for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")
+            ] == before[table]
+        evidence = [
+            dict(row)
+            for row in connection.execute("SELECT * FROM finding_evidence ORDER BY id")
+        ]
+        assert [row["id"] for row in evidence] == [row["id"] for row in before["finding_evidence"]]
+        assert [row["session_id"] for row in evidence] == [
+            row["session_id"] for row in before["finding_evidence"]
+        ]
+        metadata = json.loads(
+            connection.execute(
+                "SELECT metadata FROM projects WHERE id=?", (project.project.id,)
+            ).fetchone()[0]
+        )
+        assert "privacy_identity_conflicts" not in metadata
+    detail = FindingsService(service.repository).detail(finding_id)
+    assert len(detail.evidence) == 13
+    assert {item.evidence.id for item in detail.evidence} == {
+        row["id"] for row in before["finding_evidence"]
+    }
+    service.discover()
+    reloaded = WorkspaceService(service.repository.path)
+    assert len(reloaded.snapshot().projects) == 1
+    assert reloaded.snapshot().projects[0].project.privacy_state is Privacy.EXCLUDED
+    assert reloaded.snapshot().identity_conflicts == ()
+    assert reloaded.import_included().blocked == 13
+
+
+def test_keep_included_merge_waits_for_explicit_import(workspace, monkeypatch):
+    service, conflict, _ = privacy_conflict_repro(workspace)
+    _, repo, source = workspace
+    write_session(source, repo, 14)
+    service.discover()
+    (conflict,) = service.snapshot().identity_conflicts
+    calls = []
+    original_loader = service.adapter.load_raw_session
+    monkeypatch.setattr(
+        service.adapter,
+        "load_raw_session",
+        lambda reference: (
+            calls.append(reference.source_session_id),
+            original_loader(reference),
+        )[1],
+    )
+    service.resolve_project_privacy_conflict(conflict, Privacy.INCLUDED)
+    assert service.resolve_project_privacy_conflict(
+        conflict, Privacy.INCLUDED
+    ) == "Project conflict was already resolved."
+    (project,) = service.snapshot().projects
+    assert project.project.privacy_state is Privacy.INCLUDED
+    assert project.imported == 13 and project.discovered == 14
+    assert calls == []
+    result = service.import_included()
+    assert result.imported == 1 and result.unchanged == 13 and result.failed == 0
+    assert len(calls) == 14
+    service.discover()
+    reloaded = WorkspaceService(service.repository.path)
+    assert len(reloaded.snapshot().projects) == 1
+    assert reloaded.snapshot().identity_conflicts == ()
+    assert reloaded.import_included().unchanged == 14
+
+
+def test_keep_separate_is_persisted_and_resolution_is_idempotent(workspace):
+    service, conflict, _ = privacy_conflict_repro(workspace)
+    before = counts(service)
+    before_states = {
+        view.project.id: view.project.privacy_state for view in service.snapshot().projects
+    }
+    service.resolve_project_privacy_conflict(conflict, None)
+    assert len(service.snapshot().projects) == 2
+    assert service.snapshot().identity_conflicts == ()
+    assert {
+        view.project.id: view.project.privacy_state for view in service.snapshot().projects
+    } == before_states
+    service.resolve_project_privacy_conflict(conflict, None)
+    service.discover()
+    reloaded = WorkspaceService(service.repository.path)
+    assert len(reloaded.snapshot().projects) == 2
+    assert reloaded.snapshot().identity_conflicts == ()
+    assert counts(reloaded) == before
+    assert reloaded.import_included().imported == 0
+
+
+def test_privacy_conflict_resolution_rolls_back_if_project_delete_fails(workspace):
+    service, conflict, _ = privacy_conflict_repro(workspace)
+    with open_database(service.repository.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_conflict_merge BEFORE DELETE ON projects "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic rollback'); END"
+        )
+        before = list(connection.iterdump())
+    with pytest.raises(DatabaseError):
+        service.resolve_project_privacy_conflict(conflict, Privacy.INCLUDED)
+    with open_database(service.repository.path) as connection:
+        assert list(connection.iterdump()) == before
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert len(service.snapshot().projects) == 2
+    assert len(service.snapshot().identity_conflicts) == 1
 
 
 @pytest.mark.parametrize(
@@ -615,13 +935,54 @@ def test_identity_reconciliation_does_not_resolve_conflicting_privacy(
 )
 def test_same_visible_path_is_not_equivalence_evidence(workspace, identity):
     service, local_id, _ = legacy_identity_split(workspace)
+    service.set_privacy(local_id, Privacy.EXCLUDED)
     with open_database(service.repository.path) as connection:
         connection.execute(
             "UPDATE projects SET canonical_identity=? WHERE id=?", (identity, local_id)
         )
     service.discover()
+    snapshot = service.snapshot()
+    assert len(snapshot.projects) == 2
+    assert snapshot.identity_conflicts == ()
+    (warning,) = snapshot.identity_warnings
+    other_id = next(view.project.id for view in snapshot.projects if view.project.id != local_id)
+    assert warning.project_ids == tuple(sorted((local_id, other_id)))
+    assert set(warning.privacy_states) == {Privacy.EXCLUDED, Privacy.INCLUDED}
+    assert warning.location == str(workspace[1])
+    before_states = {
+        view.project.id: view.project.privacy_state for view in snapshot.projects
+    }
+
+    def associations():
+        with open_database(service.repository.path) as connection:
+            sessions = {
+                row["id"]: row["project_id"]
+                for row in connection.execute("SELECT id,project_id FROM sessions")
+            }
+            sources = {
+                row["id"]: (row["project_id"], row["source_id"], row["observed_path"])
+                for row in connection.execute(
+                    "SELECT id,project_id,source_id,observed_path FROM project_sources"
+                )
+            }
+        return sessions, sources
+
+    before_sessions, before_sources = associations()
+    for keep_state in (Privacy.INCLUDED, Privacy.EXCLUDED, None):
+        with pytest.raises(AfterTraceError, match="location-only identity warning"):
+            service.resolve_project_privacy_conflict(warning, keep_state)
     assert len(service.snapshot().projects) == 2
-    assert service.import_included().failed == 7
+    assert service.snapshot().identity_conflicts == ()
+    assert len(service.snapshot().identity_warnings) == 1
+    assert {
+        view.project.id: view.project.privacy_state for view in service.snapshot().projects
+    } == before_states
+    assert associations() == (before_sessions, before_sources)
+    service.discover()
+    refreshed = service.snapshot()
+    assert len(refreshed.projects) == 2
+    assert refreshed.identity_conflicts == ()
+    assert len(refreshed.identity_warnings) == 1
 
 
 def test_equal_strong_canonical_identities_reconcile(workspace):

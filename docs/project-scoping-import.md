@@ -16,7 +16,8 @@ New projects default to **Excluded**. Choose a scope, then use **Import Included
 
 After lifting Never Analyze, refresh discovery to recreate permitted lightweight references.
 Unclassified Sessions remain visible as a count and are always excluded from import. Manual
-assignment and interactive merge/separation are deferred.
+assignment remains deferred. Privacy-conflict resolution is limited to the existing project
+records described below.
 
 ## Conservative project identity
 
@@ -32,6 +33,14 @@ normalized remote can connect a later location to an existing logical project an
 Directory names and path similarity never merge projects. Non-Git, missing, foreign-platform,
 or otherwise untrustworthy paths stay unclassified. Git is optional and uses bounded,
 read-only commands without optional locks, global config, hooks, or network access.
+
+Discovery rechecks saved locations. If a location now contains another Git identity,
+a verified matching location from discovery can replace that stale association. A saved
+local Git-directory anchor can also locate a moved repository among at most 256 immediate
+siblings of its old location, using only directory metadata before verifying the exact
+match with Git. This never recurses, follows symlinks, or searches a home/root directory.
+The repair changes only project locations; imported history and privacy remain intact.
+Unavailable remote locations are retained because another clone does not prove a move.
 
 Known Never Analyze locations remain blocked when Git becomes inaccessible or changes.
 Their descendant working-directory hints also remain blocked. This conservative rule avoids
@@ -62,6 +71,15 @@ changes without undoing earlier successful sessions. If existing evidence refere
 a replacement, the failure preserves the old copy rather than invalidating evidence silently.
 Import results report imported, unchanged, blocked, and failed counts with content-free
 operation/source/project labels and retry guidance. No analysis or model call follows import.
+
+When saved project records have conflicting privacy states, Projects shows an explicit
+conflict card. A match supported by current Git identity evidence can be merged only after
+the user chooses Included or Excluded. Records that only share a saved path but have
+different Git identities show an informational identity warning; they remain separate and
+need no privacy decision. Never Analyze records cannot be merged into Included or Excluded.
+Keep Separate is remembered for proven duplicate conflicts with the existing project
+metadata. Conflict resolution preserves imported records and does not start an import;
+Excluded continues to block new imports.
 
 Sources/Projects operations run in worker threads. Navigation stays usable, scope/import
 controls pause during an operation, and closing waits for the active operation without

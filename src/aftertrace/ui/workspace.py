@@ -71,6 +71,11 @@ class WorkspaceController(QObject):
     def set_privacy(self, project_id, state) -> None:
         self.run(lambda: self.service.set_privacy(project_id, state))
 
+    def resolve_project_privacy_conflict(self, conflict, keep_state) -> None:
+        self.run(
+            lambda: self.service.resolve_project_privacy_conflict(conflict, keep_state)
+        )
+
     def _completed(self, result):
         state, notice = result
         self.state = state
@@ -152,6 +157,15 @@ class WorkspacePage(QWidget):
         self.summary = _label("No discovery metadata yet.")
         self.summary.setObjectName(f"summary{name}")
         layout.addWidget(self.summary)
+        self.conflict_panel = QWidget()
+        self.conflict_panel.setObjectName("projectPrivacyConflicts")
+        self.conflict_layout = QVBoxLayout(self.conflict_panel)
+        self.conflict_layout.setContentsMargins(0, 0, 0, 0)
+        self.conflict_layout.setSpacing(8)
+        self.conflict_action_buttons = []
+        self.conflict_panel.hide()
+        if projects:
+            layout.addWidget(self.conflict_panel)
         self.table = QTableWidget()
         self.table.setObjectName(f"table{name}")
         self.table.setColumnCount(6)
@@ -178,10 +192,25 @@ class WorkspacePage(QWidget):
         self.table.setRowCount(0)
         self.table.setRowCount(len(rows))
         if self.projects:
+            conflict_count = len(state.identity_conflicts)
+            conflict_summary = (
+                f" · {conflict_count} privacy conflict{'s' if conflict_count != 1 else ''} "
+                "require a decision"
+                if conflict_count
+                else ""
+            )
+            warning_count = len(state.identity_warnings)
+            warning_summary = (
+                f" · {warning_count} project identity warning"
+                f"{'s' if warning_count != 1 else ''}"
+                if warning_count
+                else ""
+            )
             self.summary.setText(
                 f"{len(rows)} projects · Unclassified Sessions: {state.unclassified} "
-                "(excluded from import)"
+                f"(excluded from import){conflict_summary}{warning_summary}"
             )
+            self._render_conflicts(state.identity_conflicts, state.identity_warnings)
         else:
             self.summary.setText(
                 f"{len(rows)} recorded Codex sources. No sources detected yet."
@@ -226,6 +255,12 @@ class WorkspacePage(QWidget):
                 combo.setToolTip(
                     "Never Analyze removes imported copies and prevents retaining session content."
                 )
+                unresolved_ids = {
+                    project_id
+                    for conflict in state.identity_conflicts
+                    for project_id in conflict.project_ids
+                }
+                combo.setEnabled(view.project.id not in unresolved_ids)
                 combo.currentIndexChanged.connect(
                     lambda index, project_id=view.project.id, control=combo: (
                         self.controller.set_privacy(project_id, control.itemData(index))
@@ -234,6 +269,89 @@ class WorkspacePage(QWidget):
                 self.table.setCellWidget(index, 5, combo)
         self.table.resizeRowsToContents()
         self.set_busy(self.controller.busy)
+
+    def _render_conflicts(self, conflicts, warnings):
+        while self.conflict_layout.count():
+            item = self.conflict_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.conflict_action_buttons = []
+        for warning in warnings:
+            heading = _label("Project identity mismatch")
+            heading.setObjectName(f"projectIdentityWarning_{warning.warning_id}")
+            self.conflict_layout.addWidget(heading)
+            self.conflict_layout.addWidget(
+                _label(
+                    "Two project records use the same location, but their Git identities differ. "
+                    "AfterTrace is keeping them separate because a shared path alone does not "
+                    "prove they are the same repository."
+                )
+            )
+            self.conflict_layout.addWidget(_label(f"Location: {warning.location}"))
+            for index, name in enumerate(warning.project_names):
+                privacy = warning.privacy_states[index].value.replace("_", " ").title()
+                self.conflict_layout.addWidget(
+                    _label(
+                        f"{name} · {warning.discovered_sessions[index]} discovered · "
+                        f"{warning.imported_sessions[index]} imported · {privacy}"
+                    )
+                )
+        for conflict in conflicts:
+            heading = _label("Privacy conflict · explicit choice required")
+            heading.setObjectName(f"privacyConflictTitle_{conflict.conflict_id}")
+            self.conflict_layout.addWidget(heading)
+            self.conflict_layout.addWidget(
+                _label(
+                    "Current Git identity evidence matches these records, but their privacy "
+                    "settings differ. Choose the policy to use before reconciling them."
+                )
+            )
+            self.conflict_layout.addWidget(_label(f"Location: {conflict.location}"))
+            for index, name in enumerate(conflict.project_names):
+                privacy = conflict.privacy_states[index].value.replace("_", " ").title()
+                self.conflict_layout.addWidget(
+                    _label(
+                        f"{name} · {privacy} · {conflict.discovered_sessions[index]} discovered · "
+                        f"{conflict.imported_sessions[index]} imported"
+                    )
+                )
+            actions = QHBoxLayout()
+            if conflict.can_merge_without_purging:
+                for title, privacy in (
+                    ("Keep Excluded", ProjectPrivacyState.EXCLUDED),
+                    ("Keep Included", ProjectPrivacyState.INCLUDED),
+                ):
+                    button = QPushButton(title)
+                    button.setObjectName(
+                        f"resolve_{conflict.conflict_id}_{privacy.value}"
+                    )
+                    button.clicked.connect(
+                        lambda _checked=False, current=conflict, state=privacy: (
+                            self.controller.resolve_project_privacy_conflict(current, state)
+                        )
+                    )
+                    actions.addWidget(button)
+                    self.conflict_action_buttons.append(button)
+            else:
+                self.conflict_layout.addWidget(
+                    _label(
+                        "Never Analyze cannot be merged without weakening its privacy "
+                        "guarantee or purging retained history. Keep these records separate."
+                    )
+                )
+            separate = QPushButton("Keep Separate")
+            separate.setObjectName(f"resolve_{conflict.conflict_id}_separate")
+            separate.clicked.connect(
+                lambda _checked=False, current=conflict: (
+                    self.controller.resolve_project_privacy_conflict(current, None)
+                )
+            )
+            actions.addWidget(separate)
+            self.conflict_action_buttons.append(separate)
+            actions.addStretch()
+            self.conflict_layout.addLayout(actions)
+        self.conflict_panel.setVisible(bool(conflicts or warnings))
 
     def set_busy(self, busy: bool):
         self.discover_button.setEnabled(not busy)
@@ -246,3 +364,5 @@ class WorkspacePage(QWidget):
             )
         )
         self.table.setEnabled(not busy)
+        for button in self.conflict_action_buttons:
+            button.setEnabled(not busy)

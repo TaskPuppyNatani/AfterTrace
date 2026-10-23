@@ -3,6 +3,7 @@
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
+from itertools import combinations
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
@@ -28,10 +29,15 @@ from aftertrace.core.models import (
 from aftertrace.platform.projects import ProjectIdentity, contains_location, normalize_location
 from aftertrace.services.database import open_database, purge_project_content
 from aftertrace.services.finding_store import evidence_for, read_evidence, read_finding, synchronize
-from aftertrace.services.project_reconciliation import reconcile_project_identity
+from aftertrace.services.project_reconciliation import (
+    reconcile_project_identity,
+    relocate_project_locations,
+)
 from aftertrace.services.state import (
     EvidenceView,
     FindingDetail,
+    ProjectIdentityWarning,
+    ProjectPrivacyConflict,
     ProjectView,
     SourceView,
     WorkspaceSnapshot,
@@ -44,6 +50,287 @@ def _now() -> str:
 
 def _date(value):
     return datetime.fromisoformat(value) if value else None
+
+
+_IDENTITY_CONFLICTS_KEY = "privacy_identity_conflicts"
+_IDENTITY_SEPARATIONS_KEY = "identity_separations"
+_SEPARATED_PROJECT_PAIRS_KEY = "separated_project_pairs"
+_IDENTITY_RESOLUTIONS_KEY = "privacy_identity_resolutions"
+
+
+def _project_pair_key(project_ids):
+    return str(uuid5(NAMESPACE_URL, "separate-project-pair:" + ":".join(sorted(project_ids))))
+
+
+def _privacy_conflict_id(project_ids, canonical_identities, location):
+    normalized = normalize_location(location)
+    if normalized is None:
+        return None
+    by_id = sorted(zip(project_ids, canonical_identities, strict=True))
+    payload = json.dumps(
+        {
+            "project_ids": [item[0] for item in by_id],
+            "canonical_identities": [item[1] for item in by_id],
+            "location": normalized,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return str(uuid5(NAMESPACE_URL, "project-privacy-conflict:" + payload))
+
+
+def _separation_values(metadata, key):
+    value = metadata.get(key, [])
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return set(value)
+    return set()
+
+
+def _matching_project_rows(connection, identity):
+    return connection.execute(
+        "SELECT * FROM projects WHERE canonical_identity IN (?, ?)",
+        (identity.canonical_identity, identity.local_identity),
+    ).fetchall()
+
+
+def _record_identity_conflicts(connection, identity, rows):
+    for left, right in combinations(rows, 2):
+        if left["privacy_state"] == right["privacy_state"]:
+            continue
+        pair = sorted((left, right), key=lambda row: row["id"])
+        project_ids = tuple(row["id"] for row in pair)
+        canonical_identities = tuple(row["canonical_identity"] for row in pair)
+        conflict_id = _privacy_conflict_id(project_ids, canonical_identities, identity.root)
+        if conflict_id is None:
+            continue
+        marker = {
+            "project_ids": list(project_ids),
+            "canonical_identities": list(canonical_identities),
+            "location": identity.root,
+            "match_basis": "verified_identity",
+        }
+        for row in pair:
+            current = connection.execute(
+                "SELECT metadata FROM projects WHERE id=?", (row["id"],)
+            ).fetchone()
+            metadata = json.loads(current["metadata"])
+            conflicts = metadata.get(_IDENTITY_CONFLICTS_KEY, {})
+            if not isinstance(conflicts, dict) or conflicts.get(conflict_id) == marker:
+                continue
+            conflicts[conflict_id] = marker
+            metadata[_IDENTITY_CONFLICTS_KEY] = conflicts
+            connection.execute(
+                "UPDATE projects SET metadata=?,updated_at=? WHERE id=?",
+                (json.dumps(metadata), _now(), row["id"]),
+            )
+
+
+def _identity_is_separated(rows):
+    project_ids = {row["id"] for row in rows}
+    for row in rows:
+        separated = _separation_values(
+            json.loads(row["metadata"]), _SEPARATED_PROJECT_PAIRS_KEY
+        )
+        if any(
+            _project_pair_key((row["id"], other_id)) in separated
+            for other_id in project_ids
+            if other_id != row["id"]
+        ):
+            return True
+    return False
+
+
+def _project_privacy_conflicts(connection, projects):
+    by_id = {view.project.id: view for view in projects}
+    conflicts = {}
+
+    def add(project_ids, location, match_basis):
+        if match_basis not in {"verified_identity", "canonical_identity"}:
+            return
+        if len(project_ids) != 2 or any(project_id not in by_id for project_id in project_ids):
+            return
+        views = tuple(
+            sorted((by_id[item] for item in project_ids), key=lambda item: item.project.id)
+        )
+        if views[0].project.privacy_state is views[1].project.privacy_state:
+            return
+        ids = tuple(view.project.id for view in views)
+        canonical = tuple(view.project.canonical_identity for view in views)
+        conflict_id = _privacy_conflict_id(ids, canonical, location)
+        if conflict_id is None:
+            return
+        if any(
+            conflict_id
+            in _separation_values(view.project.metadata, _IDENTITY_SEPARATIONS_KEY)
+            for view in views
+        ):
+            return
+        conflict = ProjectPrivacyConflict(
+            conflict_id=conflict_id,
+            project_ids=ids,
+            project_names=tuple(view.project.display_name for view in views),
+            privacy_states=tuple(view.project.privacy_state for view in views),
+            canonical_identities=canonical,
+            location=location,
+            match_basis=match_basis,
+            imported_sessions=tuple(view.imported for view in views),
+            discovered_sessions=tuple(view.discovered for view in views),
+        )
+        conflicts[conflict_id] = conflict
+
+    for view in projects:
+        markers = view.project.metadata.get(_IDENTITY_CONFLICTS_KEY, {})
+        if not isinstance(markers, dict):
+            continue
+        for marker in markers.values():
+            if isinstance(marker, dict):
+                add(
+                    tuple(marker.get("project_ids", ())),
+                    marker.get("location"),
+                    marker.get("match_basis", "verified_identity"),
+                )
+
+    for left, right in combinations(projects, 2):
+        if left.project.privacy_state is right.project.privacy_state:
+            continue
+        if (
+            left.project.canonical_identity
+            and left.project.canonical_identity == right.project.canonical_identity
+        ):
+            current = max(
+                (left, right),
+                key=lambda view: (
+                    view.discovered,
+                    view.project.updated_at.isoformat() if view.project.updated_at else "",
+                ),
+            )
+            location = current.project.primary_location or (
+                current.locations[0] if current.locations else None
+            )
+            add((left.project.id, right.project.id), location, "canonical_identity")
+
+    return tuple(
+        sorted(
+            conflicts.values(),
+            key=lambda item: (item.project_names, item.location, item.project_ids),
+        )
+    )
+
+
+def _project_identity_warnings(projects, privacy_conflicts):
+    proven_pairs = {frozenset(conflict.project_ids) for conflict in privacy_conflicts}
+    warnings = {}
+    for left, right in combinations(projects, 2):
+        if left.project.privacy_state is right.project.privacy_state:
+            continue
+        left_identity = left.project.canonical_identity
+        right_identity = right.project.canonical_identity
+        if not left_identity or not right_identity or left_identity == right_identity:
+            continue
+        ids = (left.project.id, right.project.id)
+        pair = frozenset(ids)
+        if pair in proven_pairs:
+            continue
+        pair_key = _project_pair_key(ids)
+        if any(
+            pair_key
+            in _separation_values(view.project.metadata, _SEPARATED_PROJECT_PAIRS_KEY)
+            for view in (left, right)
+        ):
+            continue
+        left_locations = {
+            normalize_location(path): path for path in left.locations if normalize_location(path)
+        }
+        right_locations = {
+            normalize_location(path): path for path in right.locations if normalize_location(path)
+        }
+        common = sorted(left_locations.keys() & right_locations.keys())
+        if not common:
+            continue
+        location = left_locations[common[0]]
+        warning_id = _privacy_conflict_id(ids, (left_identity, right_identity), location)
+        if warning_id is None:
+            continue
+        ordered = tuple(sorted((left, right), key=lambda view: view.project.id))
+        warnings[warning_id] = ProjectIdentityWarning(
+            warning_id=warning_id,
+            project_ids=tuple(view.project.id for view in ordered),
+            project_names=tuple(view.project.display_name for view in ordered),
+            privacy_states=tuple(view.project.privacy_state for view in ordered),
+            location=location,
+            imported_sessions=tuple(view.imported for view in ordered),
+            discovered_sessions=tuple(view.discovered for view in ordered),
+        )
+    return tuple(
+        sorted(
+            warnings.values(),
+            key=lambda item: (item.project_names, item.location, item.project_ids),
+        )
+    )
+
+
+def _project_has_unresolved_privacy_conflict(connection, project_id):
+    project = connection.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    if project is None:
+        return False
+    metadata = json.loads(project["metadata"])
+    separations = _separation_values(metadata, _IDENTITY_SEPARATIONS_KEY)
+    others = connection.execute(
+        "SELECT * FROM projects WHERE id != ? AND privacy_state != ?",
+        (project_id, project["privacy_state"]),
+    ).fetchall()
+    for other in others:
+        other_metadata = json.loads(other["metadata"])
+        location = None
+        for owner in (metadata, other_metadata):
+            markers = owner.get(_IDENTITY_CONFLICTS_KEY, {})
+            if not isinstance(markers, dict):
+                continue
+            for marker in markers.values():
+                if (
+                    isinstance(marker, dict)
+                    and marker.get("match_basis", "verified_identity") == "verified_identity"
+                    and set(marker.get("project_ids", ())) == {project["id"], other["id"]}
+                    and marker.get("location")
+                ):
+                    location = marker["location"]
+                    break
+            if location is not None:
+                break
+        if (
+            location is None
+            and project["canonical_identity"]
+            and project["canonical_identity"] == other["canonical_identity"]
+        ):
+            candidates = (project, other)
+
+            def project_order(candidate):
+                discovered = sum(
+                    json.loads(relation["metadata"]).get("discovered", 0)
+                    for relation in connection.execute(
+                        "SELECT metadata FROM project_sources WHERE project_id=?",
+                        (candidate["id"],),
+                    )
+                )
+                return discovered, candidate["updated_at"] or ""
+
+            current = max(candidates, key=project_order)
+            location = current["primary_location"] or connection.execute(
+                "SELECT min(observed_path) FROM project_sources WHERE project_id=?",
+                (current["id"],),
+            ).fetchone()[0]
+        if location is None:
+            continue
+        conflict_id = _privacy_conflict_id(
+            (project["id"], other["id"]),
+            (project["canonical_identity"], other["canonical_identity"]),
+            location,
+        )
+        if conflict_id and conflict_id not in separations and conflict_id not in _separation_values(
+            other_metadata, _IDENTITY_SEPARATIONS_KEY
+        ):
+            return True
+    return False
 
 
 def _source(row) -> Source:
@@ -261,16 +548,24 @@ class WorkspaceRepository:
                 "WHERE p.privacy_state = 'never_analyze'"
             ):
                 if row["blocked_path"] and contains_location(row["blocked_path"], hint):
+                    if identity is not None:
+                        matches = _matching_project_rows(connection, identity)
+                        if (
+                            len({item["privacy_state"] for item in matches}) > 1
+                            and not _identity_is_separated(matches)
+                        ):
+                            _record_identity_conflicts(connection, identity, matches)
                     return _project(
                         {key: row[key] for key in row.keys() if key != "blocked_path"}
                     ), row["blocked_path"]
         if identity is None:
             return None, None
-        rows = connection.execute(
-            "SELECT * FROM projects WHERE canonical_identity IN (?, ?)",
-            (identity.canonical_identity, identity.local_identity),
-        ).fetchall()
+        rows = _matching_project_rows(connection, identity)
         if rows:
+            if _identity_is_separated(rows):
+                return None, None
+            if len({row["privacy_state"] for row in rows}) > 1:
+                _record_identity_conflicts(connection, identity, rows)
             row = reconcile_project_identity(connection, identity, rows)
             # Conflicting policy/metadata remains ambiguous and never grants permission.
             return (_project(row), identity.root) if row else (None, None)
@@ -353,12 +648,28 @@ class WorkspaceRepository:
                     else None,
                     fingerprint_hint=reference.fingerprint_hint,
                     session_id=old["session_id"]
-                    if old and old["project_id"] == project_id
+                    if old and (old["project_id"] == project_id or project_id is None)
                     else None,
                     discovered_at=now,
                     available=1,
                 )
                 _save(connection, "discovered_sessions", data)
+
+    def reconcile_project_locations(self, project_id, identity, old_locations) -> None:
+        with open_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            project = connection.execute(
+                "SELECT * FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            if (
+                project is None
+                or project["privacy_state"] == ProjectPrivacyState.NEVER_ANALYZE
+                or project["canonical_identity"] not in (
+                    identity.canonical_identity, identity.local_identity
+                )
+            ):
+                return
+            relocate_project_locations(connection, project, identity, old_locations)
 
     def set_privacy(self, project_id: str, state: ProjectPrivacyState) -> None:
         state = ProjectPrivacyState(state)
@@ -374,6 +685,236 @@ class WorkspaceRepository:
                 "UPDATE projects SET privacy_state = ?, updated_at = ? WHERE id = ?",
                 (state.value, _now(), project_id),
             )
+
+    def resolve_project_privacy_conflict(
+        self,
+        conflict: ProjectPrivacyConflict,
+        keep_state: ProjectPrivacyState | None,
+        identity: ProjectIdentity | None = None,
+    ) -> str:
+        """Resolve a displayed conflict atomically; None records an explicit Keep Separate."""
+        if not isinstance(conflict, ProjectPrivacyConflict) or conflict.match_basis not in {
+            "verified_identity",
+            "canonical_identity",
+        }:
+            raise AfterTraceError(
+                "A location-only identity warning cannot be resolved as a project merge.",
+                operation="resolve_project_conflict",
+            )
+        with open_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM projects WHERE id IN (?, ?) ORDER BY id",
+                conflict.project_ids,
+            ).fetchall()
+            selected_value = None if keep_state is None else ProjectPrivacyState(keep_state).value
+            if len(rows) == 1:
+                resolutions = json.loads(rows[0]["metadata"]).get(
+                    _IDENTITY_RESOLUTIONS_KEY, {}
+                )
+                if isinstance(resolutions, dict) and conflict.conflict_id in resolutions:
+                    if resolutions[conflict.conflict_id] == selected_value:
+                        return "Project conflict was already resolved."
+                    raise AfterTraceError(
+                        "Project conflict was already merged with a different privacy choice.",
+                        operation="resolve_project_conflict",
+                    )
+                raise AfterTraceError(
+                    "Project conflict is no longer available; reload Projects.",
+                    operation="resolve_project_conflict",
+                )
+            if len(rows) != 2:
+                raise AfterTraceError(
+                    "Project conflict is no longer available; reload Projects.",
+                    operation="resolve_project_conflict",
+                )
+            ids = tuple(row["id"] for row in rows)
+            canonical = tuple(row["canonical_identity"] for row in rows)
+            states = tuple(ProjectPrivacyState(row["privacy_state"]) for row in rows)
+            current_id = _privacy_conflict_id(ids, canonical, conflict.location)
+            if (
+                ids != conflict.project_ids
+                or canonical != conflict.canonical_identities
+                or states != conflict.privacy_states
+                or current_id != conflict.conflict_id
+            ):
+                raise AfterTraceError(
+                    "Project conflict changed; reload Projects before resolving it.",
+                    operation="resolve_project_conflict",
+                )
+            if states[0] is states[1]:
+                raise AfterTraceError(
+                    "Project privacy no longer conflicts; reload Projects.",
+                    operation="resolve_project_conflict",
+                )
+
+            marker_found = False
+            for row in rows:
+                metadata = json.loads(row["metadata"])
+                markers = metadata.get(_IDENTITY_CONFLICTS_KEY, {})
+                marker_found = marker_found or (
+                    isinstance(markers, dict) and conflict.conflict_id in markers
+                )
+            pair_key = _project_pair_key(ids)
+            if keep_state is None and any(
+                conflict.conflict_id
+                in _separation_values(json.loads(row["metadata"]), _IDENTITY_SEPARATIONS_KEY)
+                and pair_key
+                in _separation_values(json.loads(row["metadata"]), _SEPARATED_PROJECT_PAIRS_KEY)
+                for row in rows
+            ):
+                return "Projects were already kept separate."
+            same_canonical = bool(canonical[0]) and canonical[0] == canonical[1]
+            identity_proven = (
+                marker_found
+                if conflict.match_basis == "verified_identity"
+                else same_canonical
+            )
+            if not identity_proven:
+                raise AfterTraceError(
+                    "Current Git identity evidence does not prove these are the same project.",
+                    operation="resolve_project_conflict",
+                )
+
+            if keep_state is None:
+                for row in rows:
+                    metadata = json.loads(row["metadata"])
+                    metadata[_IDENTITY_SEPARATIONS_KEY] = sorted(
+                        _separation_values(metadata, _IDENTITY_SEPARATIONS_KEY)
+                        | {conflict.conflict_id}
+                    )
+                    metadata[_SEPARATED_PROJECT_PAIRS_KEY] = sorted(
+                        _separation_values(metadata, _SEPARATED_PROJECT_PAIRS_KEY) | {pair_key}
+                    )
+                    markers = metadata.get(_IDENTITY_CONFLICTS_KEY, {})
+                    if isinstance(markers, dict):
+                        markers.pop(conflict.conflict_id, None)
+                        if markers:
+                            metadata[_IDENTITY_CONFLICTS_KEY] = markers
+                        else:
+                            metadata.pop(_IDENTITY_CONFLICTS_KEY, None)
+                    connection.execute(
+                        "UPDATE projects SET metadata=?,updated_at=? WHERE id=?",
+                        (json.dumps(metadata), _now(), row["id"]),
+                    )
+                return "Projects remain separate. This identity conflict is saved as resolved."
+
+            selected = ProjectPrivacyState(keep_state)
+            if not conflict.can_merge_without_purging or selected not in (
+                ProjectPrivacyState.INCLUDED,
+                ProjectPrivacyState.EXCLUDED,
+            ):
+                raise AfterTraceError(
+                    "This conflict cannot be merged without weakening Never Analyze "
+                    "or purging data.",
+                    operation="resolve_project_conflict",
+                )
+            if identity is None or normalize_location(identity.root) != normalize_location(
+                conflict.location
+            ):
+                raise AfterTraceError(
+                    "Current repository identity could not be reconfirmed; refresh discovery.",
+                    operation="resolve_project_conflict",
+                )
+            if (
+                identity.canonical_identity not in canonical
+                and identity.local_identity not in canonical
+            ):
+                raise AfterTraceError(
+                    "Current repository identity no longer matches these records.",
+                    operation="resolve_project_conflict",
+                )
+
+            reconciliation_rows = []
+            for row in rows:
+                metadata = json.loads(row["metadata"])
+                separations = _separation_values(metadata, _IDENTITY_SEPARATIONS_KEY)
+                separations.discard(conflict.conflict_id)
+                pairs = _separation_values(metadata, _SEPARATED_PROJECT_PAIRS_KEY)
+                pairs.discard(pair_key)
+                if separations:
+                    metadata[_IDENTITY_SEPARATIONS_KEY] = sorted(separations)
+                else:
+                    metadata.pop(_IDENTITY_SEPARATIONS_KEY, None)
+                if pairs:
+                    metadata[_SEPARATED_PROJECT_PAIRS_KEY] = sorted(pairs)
+                else:
+                    metadata.pop(_SEPARATED_PROJECT_PAIRS_KEY, None)
+                markers = metadata.get(_IDENTITY_CONFLICTS_KEY, {})
+                if isinstance(markers, dict):
+                    markers.pop(conflict.conflict_id, None)
+                    if markers:
+                        metadata[_IDENTITY_CONFLICTS_KEY] = markers
+                    else:
+                        metadata.pop(_IDENTITY_CONFLICTS_KEY, None)
+                resolutions = metadata.get(_IDENTITY_RESOLUTIONS_KEY, {})
+                if not isinstance(resolutions, dict):
+                    raise AfterTraceError(
+                        "Project resolution metadata is invalid; no changes were saved.",
+                        operation="resolve_project_conflict",
+                    )
+                resolutions[conflict.conflict_id] = selected.value
+                metadata[_IDENTITY_RESOLUTIONS_KEY] = resolutions
+                row_data = dict(row)
+                row_data["metadata"] = json.dumps(metadata)
+                reconciliation_rows.append(row_data)
+                connection.execute(
+                    "UPDATE projects SET metadata=? WHERE id=?",
+                    (json.dumps(metadata), row["id"]),
+                )
+
+            merged = reconcile_project_identity(
+                connection,
+                identity,
+                reconciliation_rows,
+                privacy_resolution=selected.value,
+            )
+            if merged is None:
+                raise AfterTraceError(
+                    "Project records could not be safely reconciled; no changes were saved.",
+                    operation="resolve_project_conflict",
+                )
+            location = normalize_location(conflict.location)
+            for reference in connection.execute(
+                "SELECT id, source_id, source_session_id, project_hint FROM discovered_sessions "
+                "WHERE available=1 AND project_id IS NULL"
+            ).fetchall():
+                if normalize_location(reference["project_hint"]) != location:
+                    continue
+                existing = None
+                if reference["source_session_id"] is not None:
+                    existing = connection.execute(
+                        "SELECT id FROM sessions WHERE source_id=? AND source_session_id=? "
+                        "AND project_id=?",
+                        (reference["source_id"], reference["source_session_id"], merged["id"]),
+                    ).fetchone()
+                connection.execute(
+                    "UPDATE discovered_sessions SET project_id=?,session_id=COALESCE(session_id,?) "
+                    "WHERE id=?",
+                    (merged["id"], existing["id"] if existing else None, reference["id"]),
+                )
+            for relation in connection.execute(
+                "SELECT id,source_id,observed_path,metadata FROM project_sources "
+                "WHERE project_id=?",
+                (merged["id"],),
+            ).fetchall():
+                if normalize_location(relation["observed_path"]) != location:
+                    continue
+                discovered = sum(
+                    normalize_location(item[0]) == location
+                    for item in connection.execute(
+                        "SELECT project_hint FROM discovered_sessions WHERE source_id=? "
+                        "AND project_id=? AND available=1",
+                        (relation["source_id"], merged["id"]),
+                    )
+                )
+                relation_metadata = json.loads(relation["metadata"])
+                relation_metadata["discovered"] = discovered
+                connection.execute(
+                    "UPDATE project_sources SET metadata=? WHERE id=?",
+                    (json.dumps(relation_metadata), relation["id"]),
+                )
+            return f"Projects merged. Privacy is {selected.value.title()}; import remains explicit."
 
     def reference_ids(self) -> list[str]:
         with open_database(self.path) as connection:
@@ -417,6 +958,8 @@ class WorkspaceRepository:
             ).fetchone()
             project = _project(project_row)
             if project.privacy_state is not ProjectPrivacyState.INCLUDED:
+                return "blocked"
+            if _project_has_unresolved_privacy_conflict(connection, project.id):
                 return "blocked"
             if not json.loads(row["source_metadata"]).get("available", False):
                 return "blocked"
@@ -555,4 +1098,11 @@ class WorkspaceRepository:
                 "SELECT count(*) FROM discovered_sessions "
                 "WHERE project_id IS NULL AND available = 1"
             ).fetchone()[0]
-            return WorkspaceSnapshot(tuple(projects), tuple(sources), unclassified, never_count)
+            return WorkspaceSnapshot(
+                tuple(projects),
+                tuple(sources),
+                unclassified,
+                never_count,
+                conflicts := _project_privacy_conflicts(connection, projects),
+                _project_identity_warnings(projects, conflicts),
+            )

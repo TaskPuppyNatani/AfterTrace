@@ -20,13 +20,27 @@ def _metadata(rows, ignored=()):
         for key, value in json.loads(row["metadata"]).items():
             if key in ignored:
                 continue
+            if key in ("privacy_identity_conflicts", "privacy_identity_resolutions"):
+                current = result.setdefault(key, {})
+                if not isinstance(value, dict) or any(
+                    conflict_id in current and current[conflict_id] != conflict
+                    for conflict_id, conflict in value.items()
+                ):
+                    return None
+                current.update(value)
+                continue
+            if key in ("identity_separations", "separated_project_pairs"):
+                if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                    return None
+                result[key] = sorted(set(result.get(key, ())) | set(value))
+                continue
             if key in result and result[key] != value:
                 return None  # Preserve conflicting user metadata instead of choosing a winner.
             result[key] = value
     return result
 
 
-def _relations(connection, rows, survivor_id, canonical):
+def _relations(connection, rows, survivor_id, canonical, relocations=None):
     """Plan relation consolidation before changing anything; reject conflicting metadata."""
     aliases = {row["canonical_identity"] for row in rows}
     grouped = defaultdict(list)
@@ -34,6 +48,10 @@ def _relations(connection, rows, survivor_id, canonical):
         for relation in connection.execute(
             "SELECT * FROM project_sources WHERE project_id = ? ORDER BY id", (row["id"],)
         ):
+            relation = dict(relation)
+            location = normalize_location(relation["observed_path"])
+            if relocations and location in relocations:
+                relation["observed_path"] = relocations[location]
             location = normalize_location(relation["observed_path"])
             grouped[(relation["source_id"], location or relation["id"])].append(relation)
     result = []
@@ -73,6 +91,44 @@ def _relations(connection, rows, survivor_id, canonical):
             )
         )
     return result
+
+
+def _write_relations(connection, relations):
+    for relation in relations:
+        connection.execute(
+            "INSERT INTO project_sources (id,project_id,source_id,source_project_identifier,"
+            "observed_path,first_seen_at,last_seen_at,metadata) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, "
+            "source_project_identifier=excluded.source_project_identifier,"
+            "observed_path=excluded.observed_path,"
+            "first_seen_at=excluded.first_seen_at,last_seen_at=excluded.last_seen_at,"
+            "metadata=excluded.metadata",
+            relation[:-1],
+        )
+        for old in relation[-1]:
+            if old != relation[0]:
+                connection.execute("DELETE FROM project_sources WHERE id=?", (old,))
+
+
+def relocate_project_locations(connection, project, identity, old_locations):
+    """Repair only location associations; imported history and identity stay untouched."""
+    relocations = {
+        normalize_location(location): identity.root for location in old_locations
+        if normalize_location(location) != normalize_location(identity.root)
+    }
+    if not relocations:
+        return
+    relations = _relations(
+        connection, [project], project["id"], project["canonical_identity"], relocations
+    )
+    if relations is None:
+        return  # Preserve conflicting location metadata instead of choosing a winner.
+    _write_relations(connection, relations)
+    if normalize_location(project["primary_location"]) in relocations:
+        connection.execute(
+            "UPDATE projects SET primary_location=?,updated_at=? WHERE id=?",
+            (identity.root, datetime.now(UTC).isoformat(), project["id"]),
+        )
 
 
 def _finding_projects(connection, mapping):
@@ -123,8 +179,17 @@ def _finding_projects(connection, mapping):
             )
 
 
-def reconcile_project_identity(connection, identity: ProjectIdentity, rows):
-    if len({row["privacy_state"] for row in rows}) != 1:
+def reconcile_project_identity(
+    connection, identity: ProjectIdentity, rows, *, privacy_resolution=None
+):
+    states = {row["privacy_state"] for row in rows}
+    if len(states) != 1:
+        if privacy_resolution not in ("included", "excluded") or states != {
+            "included",
+            "excluded",
+        }:
+            return None
+    elif privacy_resolution is not None:
         return None
     survivor = min(
         rows,
@@ -154,31 +219,20 @@ def reconcile_project_identity(connection, identity: ProjectIdentity, rows):
             "rule_drafts",
         ):
             connection.execute(f"UPDATE {table} SET project_id=? WHERE project_id=?", (new, old))
-    for relation in relations:
-        connection.execute(
-            "INSERT INTO project_sources (id,project_id,source_id,source_project_identifier,"
-            "observed_path,first_seen_at,last_seen_at,metadata) VALUES (?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, "
-            "source_project_identifier=excluded.source_project_identifier,"
-            "first_seen_at=excluded.first_seen_at,last_seen_at=excluded.last_seen_at,"
-            "metadata=excluded.metadata",
-            relation[:-1],
-        )
-        for old in relation[-1]:
-            if old != relation[0]:
-                connection.execute("DELETE FROM project_sources WHERE id=?", (old,))
+    _write_relations(connection, relations)
     _finding_projects(connection, mapping)
     for old in mapping:
         connection.execute("DELETE FROM projects WHERE id=?", (old,))
     created = [row["created_at"] for row in rows if row["created_at"]]
     connection.execute(
         "UPDATE projects SET canonical_identity=?,git_remote=?,metadata=?,created_at=?,"
-        "updated_at=? WHERE id=?",
+        "privacy_state=?,updated_at=? WHERE id=?",
         (
             identity.canonical_identity,
             identity.git_remote,
             json.dumps(metadata),
             min(created) if created else None,
+            privacy_resolution or survivor["privacy_state"],
             datetime.now(UTC).isoformat(),
             survivor["id"],
         ),

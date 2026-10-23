@@ -97,3 +97,48 @@ def test_remote_identity_also_retains_the_verified_local_git_anchor(tmp_path):
     remote = identify_project(str(repo))
     assert remote.canonical_identity == "git-remote:example.invalid/team/repo"
     assert remote.local_identity == local.local_identity == local.canonical_identity
+
+
+def test_relocation_search_checks_git_only_for_the_exact_saved_anchor(tmp_path, monkeypatch):
+    original = git_repository(tmp_path / "original")
+    identity = identify_project(str(original))
+    moved = tmp_path / "unrelated-name"
+    original.rename(moved)
+    git_repository(original)
+    git_repository(tmp_path / "original-legacy-lookalike")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    git_repository(nested / "not-a-sibling")
+    try:
+        (tmp_path / "link").symlink_to(moved, target_is_directory=True)
+    except OSError:
+        pass  # Symlink creation can require extra privileges on Windows.
+    calls = []
+    identify = projects.identify_project
+
+    def record(path):
+        calls.append(path)
+        return identify(path)
+
+    monkeypatch.setattr(projects, "identify_project", record)
+    found = projects.find_relocated_local_project(identity.canonical_identity, str(original))
+    assert found.root == str(moved)
+    assert calls == [str(moved)]
+    assert projects.find_relocated_local_project(
+        "git-remote:example.invalid/unknown", str(original)
+    ) is None
+    assert calls == [str(moved)]
+
+
+def test_relocation_search_stops_at_large_parent_and_does_not_recurse(tmp_path):
+    original = git_repository(tmp_path / "original")
+    identity = identify_project(str(original))
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    moved = nested / "moved"
+    original.rename(moved)
+    assert projects.find_relocated_local_project(identity.canonical_identity, str(original)) is None
+    moved.rename(tmp_path / "moved")
+    for number in range(257):
+        (tmp_path / f"entry-{number}").mkdir()
+    assert projects.find_relocated_local_project(identity.canonical_identity, str(original)) is None

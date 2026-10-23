@@ -8,9 +8,14 @@ from aftertrace.adapters.codex import CodexAdapter
 from aftertrace.core.errors import AfterTraceError
 from aftertrace.core.models import ProjectPrivacyState
 from aftertrace.platform.paths import database_path
-from aftertrace.platform.projects import ProjectIdentity, identify_project, normalize_location
+from aftertrace.platform.projects import (
+    ProjectIdentity,
+    find_relocated_local_project,
+    identify_project,
+    normalize_location,
+)
 from aftertrace.services.repository import WorkspaceRepository
-from aftertrace.services.state import ImportResult, WorkspaceSnapshot
+from aftertrace.services.state import ImportResult, ProjectPrivacyConflict, WorkspaceSnapshot
 
 
 class WorkspaceService:
@@ -55,14 +60,69 @@ class WorkspaceService:
                 continue
             self.repository.record_discovery(source, entries)
             count += len(entries)
+        self._reconcile_project_locations(identities)
         return (
             f"{len(sources)} Codex sources · {count} sessions discovered · "
             f"{warnings} discovery warnings. No content imported."
         )
 
+    def _reconcile_project_locations(self, identities):
+        projects = self.snapshot().projects
+        # Reuse verified session hints and saved locations before considering a bounded
+        # sibling-anchor lookup. Never Analyze's saved path blocks must not be lifted.
+        for view in projects:
+            if view.project.privacy_state is ProjectPrivacyState.NEVER_ANALYZE:
+                continue
+            locations = set(view.locations) | {view.project.primary_location}
+            for location in locations - {None}:
+                if location not in identities:
+                    identities[location] = self.identify(location)
+        for view in projects:
+            project = view.project
+            if project.privacy_state is ProjectPrivacyState.NEVER_ANALYZE:
+                continue
+            canonical = project.canonical_identity
+            if not canonical:
+                continue
+
+            def matches(identity, expected=canonical):
+                return identity is not None and expected in (
+                    identity.canonical_identity, identity.local_identity
+                )
+
+            locations = (set(view.locations) | {project.primary_location}) - {None}
+            stale = sorted(
+                location for location in locations
+                if not matches(identities[location]) and (
+                    identities[location] is not None or canonical.startswith("git-local:")
+                )
+            )
+            if not stale:
+                continue
+            destinations = {
+                normalize_location(identity.root): identity
+                for identity in identities.values() if matches(identity)
+            }
+            if not destinations:
+                for location in stale:
+                    relocated = find_relocated_local_project(canonical, location)
+                    if relocated is not None:
+                        destinations[normalize_location(relocated.root)] = relocated
+            if len(destinations) == 1:
+                destination = next(iter(destinations.values()))
+                self.repository.reconcile_project_locations(project.id, destination, stale)
+
     def set_privacy(self, project_id: str, state: ProjectPrivacyState) -> str:
         self.repository.set_privacy(project_id, state)
         return "Scope saved. Import is explicit. Refresh discovery after lifting Never Analyze."
+
+    def resolve_project_privacy_conflict(
+        self,
+        conflict: ProjectPrivacyConflict,
+        keep_state: ProjectPrivacyState | None,
+    ) -> str:
+        identity = self.identify(conflict.location) if keep_state is not None else None
+        return self.repository.resolve_project_privacy_conflict(conflict, keep_state, identity)
 
     def import_included(self) -> ImportResult:
         result = ImportResult(blocked=self.snapshot().never_analyze)

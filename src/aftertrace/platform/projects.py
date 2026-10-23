@@ -4,8 +4,10 @@ import ntpath
 import os
 import posixpath
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
@@ -115,3 +117,44 @@ def identify_project(hint: str | None) -> ProjectIdentity | None:
     return ProjectIdentity(
         canonical, Path(root).name, root, remote, "git_remote" if remote else "git_local", local
     )
+
+
+def find_relocated_local_project(canonical: str, old_location: str) -> ProjectIdentity | None:
+    """Find a moved local Git anchor among immediate siblings, without a content crawl.
+
+    Only .git directory file identities are inspected; Git runs only for an exact anchor
+    match. Remote-only identities, symlinks, worktree pointer files, large parents and
+    home/root directories deliberately do not expand this search.
+    """
+    if not canonical.startswith("git-local:"):
+        return None
+    old = Path(old_location)
+    if not old.is_absolute() or old.parent in (old, Path.home()):
+        return None
+    try:
+        with os.scandir(old.parent) as directory:
+            entries = list(islice(directory, 257))
+        if len(entries) > 256:
+            return None
+        matches = []
+        for entry in entries:
+            if entry.path == str(old) or not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                info = (Path(entry.path) / ".git").lstat()
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            if f"git-local:{info.st_dev}:{info.st_ino}" != canonical:
+                continue
+            identity = identify_project(entry.path)
+            if (
+                identity is not None
+                and identity.local_identity == canonical
+                and normalize_location(identity.root) == normalize_location(entry.path)
+            ):
+                matches.append(identity)
+        return matches[0] if len(matches) == 1 else None
+    except OSError:
+        return None

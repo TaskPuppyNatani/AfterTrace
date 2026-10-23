@@ -1,6 +1,8 @@
 import threading
+from dataclasses import replace
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import QPushButton
 
 from aftertrace.adapters.codex import CodexAdapter
 from aftertrace.core.errors import AfterTraceError
@@ -36,6 +38,43 @@ def setup_window(qtbot, tmp_path, monkeypatch, *, with_session=True, adapter=Non
     ready(qtbot, window)
     pages = {page.objectName(): page for page in window.findChildren(WorkspacePage)}
     return window, service, pages
+
+
+def create_location_mismatch(service):
+    service.discover()
+    (original,) = service.snapshot().projects
+    service.set_privacy(original.project.id, Privacy.INCLUDED)
+    identify = service.identify
+
+    def distinct_identity(hint):
+        identity = identify(hint)
+        return replace(
+            identity,
+            canonical_identity="git-local:synthetic-distinct-repository",
+            git_remote=None,
+            kind="git_local",
+            local_identity=None,
+        )
+
+    service.identify = distinct_identity
+    service.discover()
+    service.identify = identify
+    other = next(
+        view for view in service.snapshot().projects if view.project.id != original.project.id
+    )
+    (warning,) = service.snapshot().identity_warnings
+    assert service.snapshot().identity_conflicts == ()
+    return original.project.id, other.project.id, warning
+
+
+def make_same_canonical_identity(service, project_id, other_id):
+    with open_database(service.repository.path) as connection:
+        canonical = connection.execute(
+            "SELECT canonical_identity FROM projects WHERE id=?", (project_id,)
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE projects SET canonical_identity=? WHERE id=?", (canonical, other_id)
+        )
 
 
 def test_sources_projects_scope_import_and_reload(qtbot, tmp_path, monkeypatch):
@@ -97,6 +136,103 @@ def test_zero_sessions_and_controlled_errors_keep_window_functional(qtbot, tmp_p
     assert page.discover_button.isEnabled()
     window.navigation.setCurrentRow(0)
     assert window.pages.currentIndex() == 0
+
+
+def test_projects_page_shows_path_only_identity_warning_without_actions(
+    qtbot, tmp_path, monkeypatch
+):
+    window, service, pages = setup_window(qtbot, tmp_path, monkeypatch)
+    original_id, other_id, warning = create_location_mismatch(service)
+    window.navigation.setCurrentRow(3)
+    window.workspace_controller.reload()
+    ready(qtbot, window)
+    page = pages["pageProjects"]
+    assert page.table.rowCount() == 2
+    assert not page.conflict_panel.isHidden()
+    panel_text = [
+        label.text() for label in page.conflict_panel.findChildren(type(page.explanation))
+    ]
+    assert any("Project identity mismatch" in text for text in panel_text)
+    assert any("same location" in text and "Git identities differ" in text for text in panel_text)
+    assert "1 project identity warning" in page.summary.text()
+    assert "decision" not in page.summary.text().lower()
+    assert service.snapshot().identity_conflicts == ()
+    assert service.snapshot().identity_warnings[0].warning_id == warning.warning_id
+    assert (
+        service.snapshot().projects[0].project.privacy_state
+        is not service.snapshot().projects[1].project.privacy_state
+    )
+    assert page.table.cellWidget(0, 5).isEnabled()
+    assert page.table.cellWidget(1, 5).isEnabled()
+    assert not any(
+        button.objectName().startswith("resolve_") for button in page.findChildren(QPushButton)
+    )
+    assert {view.project.id for view in service.snapshot().projects} == {original_id, other_id}
+    states = {view.project.id: view.project.privacy_state for view in service.snapshot().projects}
+    service.discover()
+    window.workspace_controller.reload()
+    ready(qtbot, window)
+    assert service.snapshot().identity_conflicts == ()
+    assert len(service.snapshot().identity_warnings) == 1
+    assert {
+        view.project.id: view.project.privacy_state for view in service.snapshot().projects
+    } == states
+
+
+def test_proven_privacy_conflict_ui_offers_resolution_actions(qtbot, tmp_path, monkeypatch):
+    window, service, pages = setup_window(qtbot, tmp_path, monkeypatch)
+    original_id, other_id, _ = create_location_mismatch(service)
+    make_same_canonical_identity(service, original_id, other_id)
+    window.navigation.setCurrentRow(3)
+    window.workspace_controller.reload()
+    ready(qtbot, window)
+    page = pages["pageProjects"]
+    (conflict,) = service.snapshot().identity_conflicts
+    assert conflict.match_basis == "canonical_identity"
+    assert service.snapshot().identity_warnings == ()
+    assert "privacy conflict" in page.summary.text()
+    assert "require a decision" in page.summary.text()
+    assert page.findChild(
+        QPushButton, f"resolve_{conflict.conflict_id}_included"
+    ) is not None
+    assert page.findChild(
+        QPushButton, f"resolve_{conflict.conflict_id}_excluded"
+    ) is not None
+    assert page.findChild(
+        QPushButton, f"resolve_{conflict.conflict_id}_separate"
+    ) is not None
+
+
+def test_never_analyze_conflict_ui_only_offers_keep_separate(qtbot, tmp_path, monkeypatch):
+    window, service, pages = setup_window(qtbot, tmp_path, monkeypatch)
+    original_id, other_id, _ = create_location_mismatch(service)
+    make_same_canonical_identity(service, original_id, other_id)
+    service.set_privacy(other_id, Privacy.NEVER_ANALYZE)
+    window.navigation.setCurrentRow(3)
+    window.workspace_controller.reload()
+    ready(qtbot, window)
+    page = pages["pageProjects"]
+    (conflict,) = service.snapshot().identity_conflicts
+    assert conflict.can_merge_without_purging is False
+    action_names = {
+        button.objectName()
+        for button in page.findChildren(QPushButton)
+        if button.objectName().startswith(f"resolve_{conflict.conflict_id}_")
+    }
+    assert action_names == {f"resolve_{conflict.conflict_id}_separate"}
+    panel_text = [
+        label.text() for label in page.conflict_panel.findChildren(type(page.explanation))
+    ]
+    assert any("Never Analyze cannot be merged" in text for text in panel_text)
+
+    button = page.findChild(QPushButton, next(iter(action_names)))
+    qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not service.snapshot().identity_conflicts)
+    ready(qtbot, window)
+    assert len(service.snapshot().projects) == 2
+    assert Privacy.NEVER_ANALYZE in {
+        view.project.privacy_state for view in service.snapshot().projects
+    }
 
 
 def test_import_runs_outside_ui_thread_and_shutdown_waits_for_completion(

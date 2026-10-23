@@ -2,7 +2,14 @@
 
 from dataclasses import dataclass, field
 
-from aftertrace.core.models import Finding, FindingEvidence, Harness, Project, Source
+from aftertrace.core.models import (
+    Finding,
+    FindingEvidence,
+    Harness,
+    Project,
+    ProjectPrivacyState,
+    Source,
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +43,43 @@ class ProjectView:
 
 
 @dataclass(frozen=True)
+class ProjectPrivacyConflict:
+    """Two persisted project records needing an explicit privacy/identity decision."""
+
+    conflict_id: str
+    project_ids: tuple[str, str]
+    project_names: tuple[str, str]
+    privacy_states: tuple[ProjectPrivacyState, ProjectPrivacyState]
+    canonical_identities: tuple[str | None, str | None]
+    location: str
+    match_basis: str
+    imported_sessions: tuple[int, int]
+    discovered_sessions: tuple[int, int]
+
+    @property
+    def can_merge_without_purging(self) -> bool:
+        return self.match_basis in {"verified_identity", "canonical_identity"} and set(
+            self.privacy_states
+        ) == {
+            ProjectPrivacyState.INCLUDED,
+            ProjectPrivacyState.EXCLUDED,
+        }
+
+
+@dataclass(frozen=True)
+class ProjectIdentityWarning:
+    """Same-location project records with distinct Git identities; informational only."""
+
+    warning_id: str
+    project_ids: tuple[str, str]
+    project_names: tuple[str, str]
+    privacy_states: tuple[ProjectPrivacyState, ProjectPrivacyState]
+    location: str
+    imported_sessions: tuple[int, int]
+    discovered_sessions: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class SourceView:
     source: Source
     available: bool
@@ -50,6 +94,8 @@ class WorkspaceSnapshot:
     sources: tuple[SourceView, ...] = ()
     unclassified: int = 0
     never_analyze: int = 0
+    identity_conflicts: tuple[ProjectPrivacyConflict, ...] = ()
+    identity_warnings: tuple[ProjectIdentityWarning, ...] = ()
 
 
 @dataclass
