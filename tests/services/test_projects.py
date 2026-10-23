@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -86,3 +87,13 @@ def test_local_repository_identity_uses_git_metadata_and_survives_a_local_rename
     after = identify_project(str(moved))
     assert before.canonical_identity == after.canonical_identity
     assert str(original) not in before.canonical_identity
+
+
+def test_remote_identity_also_retains_the_verified_local_git_anchor(tmp_path):
+    repo = git_repository(tmp_path / "repo")
+    local = identify_project(str(repo))
+    subprocess.run(["git", "-C", str(repo), "config", "--local", "remote.origin.url",
+                    "https://example.invalid/team/repo.git"], check=True, capture_output=True)
+    remote = identify_project(str(repo))
+    assert remote.canonical_identity == "git-remote:example.invalid/team/repo"
+    assert remote.local_identity == local.local_identity == local.canonical_identity

@@ -1,4 +1,5 @@
 import json
+import subprocess
 import threading
 
 import pytest
@@ -468,3 +469,306 @@ def test_invalid_imported_message_fails_with_content_free_application_error(
     assert invalid not in str(caught.value)
     assert caught.value.detail is None
     assert caught.value.__suppress_context__
+
+
+def set_origin(repo, value):
+    args = ["--unset-all", "remote.origin.url"] if value is None else ["remote.origin.url", value]
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "--local", *args], check=True, capture_output=True
+    )
+
+
+def legacy_identity_split(workspace, *, with_findings=True):
+    """The field sequence: import locally, add origin, then discover with the old identity API."""
+    from aftertrace.platform.projects import ProjectIdentity
+    from aftertrace.services.findings import FindingPublicationService
+
+    service, repo, source = workspace
+    set_origin(repo, None)
+    for number in range(1, 8):
+        write_session(source, repo, number)
+    service.discover()
+    local_id = included(service)
+    assert service.import_included().imported == 7
+    set_origin(repo, "https://example.invalid/team/example.git")
+    for number in range(8, 14):
+        write_session(source, repo, number)
+    identify = service.identify
+
+    def legacy(hint):
+        identity = identify(hint)
+        return ProjectIdentity(
+            identity.canonical_identity,
+            identity.display_name,
+            identity.root,
+            identity.git_remote,
+            identity.kind,
+        )
+
+    service.identify = legacy
+    service.discover()
+    for view in service.snapshot().projects:
+        service.set_privacy(view.project.id, Privacy.INCLUDED)
+    result = service.import_included()
+    assert result.imported == 6 and result.failed == 7
+    assert sorted((view.discovered, view.imported) for view in service.snapshot().projects) == [
+        (0, 7),
+        (13, 6),
+    ]
+    service.identify = identify
+    finding_id = None
+    if with_findings:
+        (finding,) = FindingPublicationService(service.repository).run()
+        from aftertrace.core.models import FindingState
+
+        service.repository.update_finding_state(finding.id, FindingState.SAVED)
+        finding_id = finding.id
+    return service, local_id, finding_id
+
+
+def test_git_remote_promotion_preserves_one_project_and_unchanged_imports(workspace):
+    service, repo, source = workspace
+    set_origin(repo, None)
+    for number in range(1, 8):
+        write_session(source, repo, number)
+    service.discover()
+    original = included(service)
+    assert service.import_included().imported == 7
+    set_origin(repo, "https://example.invalid/team/example.git")
+    for number in range(8, 14):
+        write_session(source, repo, number)
+    service.discover()
+    (project,) = service.snapshot().projects
+    assert project.project.id == original
+    assert project.project.canonical_identity == "git-remote:example.invalid/team/example"
+    assert project.project.privacy_state is Privacy.INCLUDED
+    result = service.import_included()
+    assert result.imported == 6 and result.unchanged == 7 and result.failed == 0
+
+
+def test_existing_six_seven_split_reconciles_without_replacing_messages_or_evidence(workspace):
+    from aftertrace.core.models import FindingState
+    from aftertrace.services.findings import FindingsService
+
+    service, old_id, finding_id = legacy_identity_split(workspace)
+    with open_database(service.repository.path) as connection:
+        before = {
+            table: [dict(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")]
+            for table in ("sessions", "messages", "tool_calls", "finding_evidence")
+        }
+    service.discover()
+    (project,) = service.snapshot().projects
+    assert project.imported == project.discovered == 13
+    assert project.project.privacy_state is Privacy.INCLUDED
+    result = service.import_included()
+    assert result.unchanged == 13 and result.failed == result.imported == 0
+    with open_database(service.repository.path) as connection:
+        for table in ("messages", "tool_calls"):
+            assert [
+                dict(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")
+            ] == before[table]
+        after = [dict(row) for row in connection.execute("SELECT * FROM sessions ORDER BY id")]
+        for row, original in zip(after, before["sessions"], strict=True):
+            assert row == {**original, "project_id": project.project.id}
+        assert connection.execute("SELECT count(*) FROM project_sources").fetchone()[0] == 1
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    receipts = service.repository.finding_evidence(finding_id)
+    assert {item.id for item in receipts} == {item["id"] for item in before["finding_evidence"]}
+    assert all(item.metadata["project_id"] == project.project.id for item in receipts)
+    (finding,) = service.repository.findings()
+    assert finding.id == finding_id and finding.state is FindingState.SAVED
+    assert finding.distinct_project_count == 1 and finding.distinct_session_count == 13
+    assert (
+        finding.metadata["project_ids"]
+        == finding.metadata["origin_project_ids"]
+        == [project.project.id]
+    )
+    assert len(FindingsService(service.repository).detail(finding_id).evidence) == 13
+    for _ in range(2):
+        reloaded = WorkspaceService(service.repository.path)
+        assert len(reloaded.snapshot().projects) == 1
+        reloaded.discover()
+        assert reloaded.import_included().unchanged == 13
+    service.set_privacy(project.project.id, Privacy.NEVER_ANALYZE)
+    assert service.repository.findings() == []
+
+
+@pytest.mark.parametrize("conflicting", [Privacy.EXCLUDED, Privacy.NEVER_ANALYZE])
+def test_identity_reconciliation_does_not_resolve_conflicting_privacy(
+    workspace, conflicting, monkeypatch
+):
+    service, local_id, _ = legacy_identity_split(workspace)
+    service.set_privacy(local_id, conflicting)
+    before = {view.project.id: view.project.privacy_state for view in service.snapshot().projects}
+    service.discover()
+    assert {
+        view.project.id: view.project.privacy_state for view in service.snapshot().projects
+    } == before
+    calls = []
+    monkeypatch.setattr(service.adapter, "load_raw_session", lambda *args: calls.append(True))
+    result = service.import_included()
+    assert result.imported == 0 and calls == []
+
+
+@pytest.mark.parametrize(
+    "identity", ["git-local:unrelated:directory", "git-remote:example.invalid/other"]
+)
+def test_same_visible_path_is_not_equivalence_evidence(workspace, identity):
+    service, local_id, _ = legacy_identity_split(workspace)
+    with open_database(service.repository.path) as connection:
+        connection.execute(
+            "UPDATE projects SET canonical_identity=? WHERE id=?", (identity, local_id)
+        )
+    service.discover()
+    assert len(service.snapshot().projects) == 2
+    assert service.import_included().failed == 7
+
+
+def test_equal_strong_canonical_identities_reconcile(workspace):
+    service, local_id, _ = legacy_identity_split(workspace)
+    with open_database(service.repository.path) as connection:
+        connection.execute(
+            "UPDATE projects SET canonical_identity=? WHERE id=?",
+            (service.identify(str(workspace[1])).canonical_identity, local_id),
+        )
+    service.discover()
+    (project,) = service.snapshot().projects
+    assert project.imported == 13
+    assert service.import_included().unchanged == 13
+
+
+def test_reconciliation_preserves_project_metadata_and_project_foreign_keys(workspace):
+    service, local_id, finding_id = legacy_identity_split(workspace)
+    with open_database(service.repository.path) as connection:
+        connection.execute(
+            "UPDATE projects SET metadata=? WHERE id=?",
+            ('{"identity_kind":"git_local","note":"preserve"}', local_id),
+        )
+        connection.execute(
+            "INSERT INTO instruction_sources (id,project_id,harness,path) "
+            "VALUES ('is',?,'codex','synthetic')",
+            (local_id,),
+        )
+        connection.execute(
+            "INSERT INTO rules (id,project_id,text) VALUES ('r',?,'Synthetic rule')", (local_id,)
+        )
+        connection.execute(
+            "INSERT INTO rule_drafts (id,project_id,finding_id,text) "
+            "VALUES ('d',?,?,'Synthetic draft')",
+            (local_id, finding_id),
+        )
+        created = connection.execute("SELECT min(created_at) FROM projects").fetchone()[0]
+        first = connection.execute("SELECT min(first_seen_at) FROM project_sources").fetchone()[0]
+    service.discover()
+    (view,) = service.snapshot().projects
+    assert view.project.metadata["note"] == "preserve"
+    assert view.project.created_at.isoformat() == created
+    with open_database(service.repository.path) as connection:
+        for table in ("instruction_sources", "rules", "rule_drafts"):
+            assert (
+                connection.execute(f"SELECT project_id FROM {table}").fetchone()[0]
+                == view.project.id
+            )
+        assert (
+            connection.execute("SELECT first_seen_at FROM project_sources").fetchone()[0] == first
+        )
+
+
+def test_reconciliation_rejects_conflicting_project_metadata_without_data_loss(workspace):
+    service, local_id, _ = legacy_identity_split(workspace)
+    with open_database(service.repository.path) as connection:
+        for row in connection.execute("SELECT id FROM projects").fetchall():
+            connection.execute(
+                "UPDATE projects SET metadata=? WHERE id=?", (json.dumps({"note": row[0]}), row[0])
+            )
+    service.discover()
+    assert len(service.snapshot().projects) == 2
+    assert service.snapshot().unclassified == 13
+
+
+def test_reconciliation_rolls_back_every_association_and_receipt_on_failure(workspace):
+    service, _, _ = legacy_identity_split(workspace)
+    source = service.snapshot().sources[0].source
+    entries = [
+        (ref, service.identify(ref.project_hint))
+        for ref in service.adapter.discover_sessions(source)
+    ]
+    with open_database(service.repository.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER synthetic_failure BEFORE DELETE ON projects "
+            "BEGIN SELECT RAISE(ABORT,'Synthetic reconciliation failure'); END"
+        )
+        before = list(connection.iterdump())
+    with pytest.raises(DatabaseError):
+        service.repository.record_discovery(source, entries)
+    with open_database(service.repository.path) as connection:
+        assert list(connection.iterdump()) == before
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_changed_fingerprint_after_reconciliation_uses_existing_update_contract(workspace):
+    service, _, _ = legacy_identity_split(workspace, with_findings=False)
+    with open_database(service.repository.path) as connection:
+        original = connection.execute(
+            "SELECT id FROM sessions WHERE source_session_id='synthetic-1'"
+        ).fetchone()[0]
+    write_session(workspace[2], workspace[1], 1, "Keep this changed synthetic instruction.")
+    service.discover()
+    result = service.import_included()
+    assert result.imported == 1 and result.unchanged == 12 and result.failed == 0
+    with open_database(service.repository.path) as connection:
+        assert (
+            connection.execute(
+                "SELECT id FROM sessions WHERE source_session_id='synthetic-1'"
+            ).fetchone()[0]
+            == original
+        )
+    assert service.import_included().unchanged == 13
+
+
+def test_changed_evidence_protected_session_still_fails_safely_after_reconciliation(workspace):
+    service, _, finding_id = legacy_identity_split(workspace)
+    receipts = service.repository.finding_evidence(finding_id)
+    write_session(workspace[2], workspace[1], 1, "Keep this changed synthetic instruction.")
+    service.discover()
+    before = {item.id: item.message_id for item in service.repository.finding_evidence(finding_id)}
+    result = service.import_included()
+    assert result.unchanged == 12 and result.failed == 1
+    assert before == {
+        item.id: item.message_id for item in service.repository.finding_evidence(finding_id)
+    }
+    assert {item.id for item in receipts} == set(before)
+
+
+def test_reconciliation_does_not_import_or_permit_unclassified_and_excluded_history(workspace):
+    service, _, _ = legacy_identity_split(workspace)
+    other = git_repository(workspace[1].parent / "excluded")
+    for number in range(100, 140):
+        write_session(workspace[2], None, number)
+    for number in (200, 201):
+        write_session(workspace[2], other, number)
+    service.discover()
+    assert service.snapshot().unclassified == 40
+    result = service.import_included()
+    assert result.unchanged == 13 and result.blocked == 42 and result.failed == 0
+    with open_database(service.repository.path) as connection:
+        assert connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 13
+
+
+@pytest.mark.parametrize("state", [Privacy.EXCLUDED, Privacy.NEVER_ANALYZE])
+def test_origin_addition_does_not_lift_existing_scope(workspace, state, monkeypatch):
+    service, repo, source = workspace
+    set_origin(repo, None)
+    write_session(source, repo)
+    service.discover()
+    (original,) = service.snapshot().projects
+    service.set_privacy(original.project.id, state)
+    set_origin(repo, "https://example.invalid/team/example.git")
+    service.discover()
+    (current,) = service.snapshot().projects
+    assert current.project.id == original.project.id
+    assert current.project.privacy_state is state
+    calls = []
+    monkeypatch.setattr(service.adapter, "load_raw_session", lambda *args: calls.append(True))
+    result = service.import_included()
+    assert result.imported == 0 and result.blocked == 1 and calls == []

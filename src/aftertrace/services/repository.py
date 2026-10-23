@@ -28,6 +28,7 @@ from aftertrace.core.models import (
 from aftertrace.platform.projects import ProjectIdentity, contains_location, normalize_location
 from aftertrace.services.database import open_database, purge_project_content
 from aftertrace.services.finding_store import evidence_for, read_evidence, read_finding, synchronize
+from aftertrace.services.project_reconciliation import reconcile_project_identity
 from aftertrace.services.state import (
     EvidenceView,
     FindingDetail,
@@ -266,12 +267,13 @@ class WorkspaceRepository:
         if identity is None:
             return None, None
         rows = connection.execute(
-            "SELECT * FROM projects WHERE canonical_identity = ?", (identity.canonical_identity,)
+            "SELECT * FROM projects WHERE canonical_identity IN (?, ?)",
+            (identity.canonical_identity, identity.local_identity),
         ).fetchall()
-        if len(rows) > 1:
-            return None, None  # Ambiguous persisted identity: no automatic merge or permission.
         if rows:
-            return _project(rows[0]), identity.root
+            row = reconcile_project_identity(connection, identity, rows)
+            # Conflicting policy/metadata remains ambiguous and never grants permission.
+            return (_project(row), identity.root) if row else (None, None)
         project = Project(
             display_name=identity.display_name,
             canonical_identity=identity.canonical_identity,

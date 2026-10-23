@@ -60,6 +60,8 @@ class ProjectIdentity:
     root: str
     git_remote: str | None
     kind: str
+    # Supplemental evidence still available after a remote becomes the preferred identity.
+    local_identity: str | None = None
 
 
 def _git(directory: Path, *args: str) -> str | None:
@@ -102,16 +104,14 @@ def identify_project(hint: str | None) -> ProjectIdentity | None:
         return None
     # A Git directory's local filesystem identity survives renames. Merely reusing a path
     # does not establish the same repository. This anchor makes no cross-machine claim.
-    if remote:
-        canonical = f"git-remote:{remote}"
-    else:
-        try:
-            info = Path(common_dir).stat()
-        except OSError:
-            return None
-        if not info.st_ino:
-            return None
-        canonical = f"git-local:{info.st_dev}:{info.st_ino}"
+    try:
+        info = Path(common_dir).stat()
+        local = f"git-local:{info.st_dev}:{info.st_ino}" if info.st_ino else None
+    except OSError:
+        local = None
+    canonical = f"git-remote:{remote}" if remote else local
+    if canonical is None:
+        return None
     return ProjectIdentity(
-        canonical, Path(root).name, root, remote, "git_remote" if remote else "git_local"
+        canonical, Path(root).name, root, remote, "git_remote" if remote else "git_local", local
     )
