@@ -54,3 +54,41 @@ project/source/session metadata, in a worker. The dialog preserves original word
 shows persisted analyzer provenance. Refresh closes and clears open evidence views;
 scope operations invalidate displayed data, and late worker results cannot restore an
 invalidated view. No transcript browser, recommendations, or provider calls are involved.
+
+## Lexical near-duplicate candidates (M5A)
+
+`NearDuplicateInstructionAnalyzer().analyze(repository.imported_messages_for_analysis())`
+produces transient candidates over the same privacy-scoped normalized messages as M4A.
+It reuses M4A's instruction extraction, noise suppression, explicit user-authorship
+check, canonical grouping, and exact original evidence spans. Exact canonical groups are
+formed first; groups below M4A's publication support floor can still contribute to a
+near-duplicate cluster.
+
+The comparison view uses NFC and case-folded tokens, expands common contractions,
+removes a small set of leading polite wrappers (`please`, `can/could/would you`, and
+`make sure [you]`), and maps a few completion endings such as `when you're done`,
+`when finished`, or `afterward` to `after`. It does not stem words or remove
+meaning-bearing terms; for example, `after implementation` and `before implementation`
+remain distinct. Original wording and source offsets are never rewritten.
+
+Compatibility requires at least two shared tokens, the same leading action after
+auxiliary/negation words, matching negation state, matching presence of a small set of
+scope/action markers (`focused/full`, `local/remote`, `only/all/any`, `before/after`,
+`allow/deny`, and `keep/replace`), and an ordered `SequenceMatcher` token ratio of at
+least **0.80** with autojunk disabled. This transparent threshold and the marker checks
+intentionally prefer false negatives. For example, focused tests and focused regression
+tests can group, while focused and full test suites, local and remote models, and push
+versus do-not-push instructions remain separate.
+
+Clustering visits exact groups in canonical-key order and admits a member only when it is
+compatible with every existing cluster member. This complete-link rule prevents an
+intermediate phrase from joining incompatible endpoints through a transitive chain.
+Candidates require at least **three distinct sessions across the whole cluster**;
+occurrence counts remain separate, and overlapping sessions count once toward support.
+Representatives are observed wording selected by session support, occurrence count,
+conciseness, and stable lexical tie-breaks. Candidate UUIDs derive from the analyzer
+version and sorted member keys, so membership, evidence order, and IDs do not depend on
+database or input iteration order.
+
+M5A stops at `near_duplicate_lexical:v1` candidates. It adds no persisted Finding,
+database migration, UI, provider call, embedding, model inference, or recommendation.
